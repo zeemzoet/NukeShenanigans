@@ -27,9 +27,6 @@ public:
     void knobs(Knob_Callback) override;
     int knob_changed(Knob *) override;
 
-    [[nodiscard]] fdk::Mat4d projectionModeMatrix(ndk::LensProjection) const override;
-    [[nodiscard]] fdk::Mat4d projectionModeMatrixAt(ndk::LensProjection, const OutputContext&) const override;
-
     static Op* Build(Node* node) { return new DummyCamera(node); }
     static const Op::Description description;
 };
@@ -66,21 +63,6 @@ int DummyCamera::knob_changed(Knob* k) {
         return 1;
     }
     return 0;
-}
-
-
-fdk::Mat4d DummyCamera::projectionModeMatrix(ndk::LensProjection mode) const {
-    if (const auto* camera_input = Op::input0()->cameraOp()) {
-        return camera_input->projectionModeMatrix(mode);
-    }
-    return CameraOp::projectionModeMatrix(mode);
-}
-
-fdk::Mat4d DummyCamera::projectionModeMatrixAt(ndk::LensProjection mode, const OutputContext &context) const {
-    if (const auto* camera_input = Op::input0()->cameraOp()) {
-            return camera_input->projectionModeMatrixAt(mode, context);
-    }
-    return CameraOp::projectionModeMatrixAt(mode, context);
 }
 
 
