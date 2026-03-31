@@ -99,22 +99,29 @@ int RemoveUnlimited::knob_changed(Knob *k) {
 void RemoveUnlimited::add_dynamic_channelknobs(void* p, Knob_Callback f) {
     if (auto* node_op = static_cast<RemoveUnlimited*>(p); node_op->get_amount() > 0) {
         node_op->resize_channel_arrays();
-        size_t count {0};
+        size_t index {0};
         for ( ChannelSet& c: node_op->get_dynamic_channels() ) {
-            Knob* k = nullptr;
-            std::string knob_name = "channels" + std::to_string(count);
-            c = f.makeKnobs() ? Mask_None : c;
+            std::string knob_name = "channels" + std::to_string(index);
 
-            if ( !f.makeKnobs() && (k = node_op->knob(knob_name.c_str()))) {
-                std::stringstream ss;
-                k->to_script(ss, nullptr, false);
-                node_op->channel_names_[count] = ss.str();
+            // Store channel names
+            if (!f.makeKnobs()) {
+                if (Knob* existing_knob = node_op->knob(knob_name.c_str())) {
+                    std::stringstream ss;
+                    existing_knob->to_script(ss, nullptr, false);
+                    node_op->channel_names_[index] = ss.str();
+                }
             }
-            k = Input_ChannelMask_knob(f, &c, 0, knob_name.c_str());
-            if (k && f.makeKnobs()) {
-                k->from_script(node_op->channel_names_[count].c_str());
+
+            // Create new knobs
+            Knob* new_knob = Input_ChannelMask_knob(f, &c, 0, knob_name.c_str());
+
+            // Restore channel from the stored strings
+            // Thank you Bart Ashworth!
+            if (f.makeKnobs() && new_knob) {
+                new_knob->from_script(node_op->channel_names_[index].c_str());
             }
-            ++count;
+
+            ++index;
         }
     }
 }
