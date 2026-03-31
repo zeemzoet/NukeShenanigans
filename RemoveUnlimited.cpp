@@ -78,7 +78,7 @@ void RemoveUnlimited::knobs(Knob_Callback f) {
     Int_knob(f, &test_amount, "Testing");
     SetFlags(f, Knob::KNOB_CHANGED_ALWAYS);
 
-    Input_ChannelMask_knob(f, &channels_, 0, "channels");
+    Input_ChannelMask_knob(f, &channels_, 0, "channels0");
 
     if (!f.makeKnobs()) add_dynamic_channelknobs(this->firstOp(), f);
 }
@@ -86,7 +86,7 @@ void RemoveUnlimited::knobs(Knob_Callback f) {
 int RemoveUnlimited::knob_changed(Knob *k) {
     if (k->is("Testing")) {
         knobs_amount = replace_knobs(
-            knob("channels"),
+            knob("channels0"),
             knobs_amount,
             add_dynamic_channelknobs,
             this->firstOp()
@@ -99,9 +99,9 @@ int RemoveUnlimited::knob_changed(Knob *k) {
 void RemoveUnlimited::add_dynamic_channelknobs(void* p, Knob_Callback f) {
     if (auto* node_op = static_cast<RemoveUnlimited*>(p); node_op->get_amount() > 0) {
         node_op->resize_channel_arrays();
-        size_t index {0};
-        for ( ChannelSet& c: node_op->get_dynamic_channels() ) {
-            std::string knob_name = "channels" + std::to_string(index);
+        for (size_t index = 0; index < node_op->get_dynamic_channels().size(); ++index) {
+            ChannelSet& channels = node_op->get_dynamic_channels()[index];
+            std::string knob_name = "channels" + std::to_string(index + 1);
 
             // Store channel names
             if (!f.makeKnobs()) {
@@ -113,10 +113,11 @@ void RemoveUnlimited::add_dynamic_channelknobs(void* p, Knob_Callback f) {
             }
 
             // Create new knobs
-            Knob* new_knob = Input_ChannelMask_knob(f, &c, 0, knob_name.c_str());
+            Knob* new_knob = Input_ChannelMask_knob(f, &channels, 0, knob_name.c_str());
+            channels = f.makeKnobs() ? Mask_None : channels;
 
             // Restore channel from the stored strings
-            // Thank you Bart Ashworth!
+            // Thank you, Bart Ashworth!
             if (f.makeKnobs() && new_knob) {
                 new_knob->from_script(node_op->channel_names_[index].c_str());
             }
