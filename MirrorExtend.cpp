@@ -56,7 +56,7 @@ void MirrorExtend::engine(int y, int x, int r, ChannelMask channels, Row& row) {
     if (y < 0)
         y = -y;
     else if (y >= height)
-        y = height - (y-height) -1;
+        y = 2*height - y -1;  //reflected y
 
     input0().get(y, 0, width, channels, input_pixels);
     foreach(z, channels) {
@@ -69,7 +69,7 @@ void MirrorExtend::engine(int y, int x, int r, ChannelMask channels, Row& row) {
                 *outptr++ = input_pixels[z][-i];
             }
             else {
-                *outptr++ = input_pixels[z][width - (i-width) -1];
+                *outptr++ = input_pixels[z][2*width -i -1];  // reflected x
             }
         }
     }
