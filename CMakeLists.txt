@@ -141,6 +141,10 @@ if (Qt6_FOUND)
     target_sources(AddCustomQt PRIVATE AddCustomQt.moc.h)
     target_link_libraries(AddCustomQt PRIVATE Qt::Core Qt::Gui Qt::Widgets)
 
+    add_example_plugin(DeepProbe DeepProbe.cpp)
+    target_sources(DeepProbe PRIVATE ProbeWidget.moc.h ProbeWidget.cpp)
+    target_link_libraries(DeepProbe PRIVATE Qt::Core Qt::Gui Qt::Widgets)
+
     find_package(Murmur3 REQUIRED)
     add_example_plugin(Cryptomatte
         CryptomatteManifest.cpp
