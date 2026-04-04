@@ -47,7 +47,7 @@ public:
     DummyDeepPixel() = default;
     explicit DummyDeepPixel(const DeepPixel&);
 
-    void draw(QPainter&, int, int, float);
+    void draw(QPainter&, int, int, float) const;
 };
 
 // QWidget used in ProbeKnob

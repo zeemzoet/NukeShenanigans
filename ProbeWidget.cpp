@@ -1,9 +1,10 @@
 //
 // Created by Hannes Sap on 03/04/2026.
 //
-#include <qboxlayout.h>
+#include <QBoxLayout>
 #include <Qpainter>
 #include <QTabWidget>
+#include "DDImage/LUT.h"
 
 #include "ProbeWidget.moc.h"
 
@@ -158,18 +159,16 @@ float DummyDeepPixel::get_unordered_sample(size_t sample, Channel channel) const
     return data[sample * requested_channels.size() + requested_channels.chanNo(channel)];
 }
 
-void DummyDeepPixel::draw(QPainter& painter, const int width, const int height, const float zoom) {
+void DummyDeepPixel::draw(QPainter& painter, const int width, const int height, const float zoom) const {
     for (size_t sample = 0; sample <= sample_count; ++sample) {
-        const float red = std::pow(get_unordered_sample(sample, Chan_Red), 1.0/2.2)*255;
-        const float green = std::pow(get_unordered_sample(sample, Chan_Green), 1.0/2.2)*255;
-        const float blue = std::pow(get_unordered_sample(sample, Chan_Blue), 1.0/2.2)*255;
+        const LUT* monitor_lut = LUT::GetBuiltinLUT(0);
+        const float red = monitor_lut->to_byte(get_unordered_sample(sample, Chan_Red));
+        const float green = monitor_lut->to_byte(get_unordered_sample(sample, Chan_Green));
+        const float blue = monitor_lut->to_byte(get_unordered_sample(sample, Chan_Blue));
 
         const float alpha = get_unordered_sample(sample, Chan_Alpha);
         const float front = get_unordered_sample(sample, Chan_DeepFront)*zoom;
         const float back = get_unordered_sample(sample, Chan_DeepBack)*zoom;
-
-        //std::cout << "Alpha: " << alpha << ", Front: " << front << ", Back: " << back << std::endl;
-        painter.setPen(QPen(Qt::green, 2));
 
         painter.setPen(QPen(QColor(red, green, blue), 2));
         painter.drawLine(front,height, back, (1-alpha)*height);

@@ -19,9 +19,6 @@ class DeepProbe : public DeepPixelOp {
     DummyDeepPixel deep_pixel_ {};
 
     void sample_deep_pixel();
-    [[nodiscard]] DeepOp* my_input() const {
-        return dynamic_cast<DeepOp*>(Op::input0());
-    }
 
 public:
     explicit DeepProbe(Node* node) : DeepPixelOp(node) {}
@@ -31,6 +28,7 @@ public:
     static const Description description;
 
     void _validate(bool) override;
+    void append(Hash &) override;
     void processSample(int, int, const DeepPixel&, size_t, const ChannelSet&, DeepOutPixel&) const override;
 
     void knobs(Knob_Callback) override;
@@ -40,6 +38,11 @@ public:
 void DeepProbe::_validate(bool for_real) {
     DeepPixelOp::_validate(for_real);
     sample_deep_pixel();
+}
+
+void DeepProbe::append(Hash& hash) {
+    hash.append(coordinate_[0]);
+    hash.append(coordinate_[1]);
 }
 
 void DeepProbe::processSample(int y,
