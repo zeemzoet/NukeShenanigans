@@ -37,7 +37,7 @@ struct NukeWidgetVisibilityCallback final : Knob::VisibilityCallbackFunctor {
 
 struct DummyDeepPixel {
 private:
-    float get_unordered_sample(size_t, Channel) const;
+    [[nodiscard]] float get_unordered_sample(size_t, Channel) const;
 
 public:
     size_t sample_count {0};
@@ -47,7 +47,7 @@ public:
     DummyDeepPixel() = default;
     explicit DummyDeepPixel(const DeepPixel&);
 
-    void draw(QPainter&, int, int, float) const;
+    void draw(QPainter&, float, float, float) const;
 };
 
 // QWidget used in ProbeKnob
@@ -78,8 +78,8 @@ class ProbeWidget : public QWidget {
     QSlider* slider_;
 
     //signals
-    void on_slider_moved(int);
-    void on_spin_changed(double);
+    void on_slider_moved(int) const;
+    void on_spin_changed(double) const;
     void apply_zoom(double) const;
 
 public:

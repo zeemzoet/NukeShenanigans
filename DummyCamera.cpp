@@ -3,6 +3,7 @@
 //
 
 #include <DDImage/CameraOp.h>
+#include <DDImage/CameraSceneOp.h>
 #include <DDImage/Knob.h>
 
 const char* CLASS = "DummyCamera";
@@ -25,7 +26,7 @@ public:
 
     void _validate(bool) override;
     void knobs(Knob_Callback) override;
-    int knob_changed(Knob *) override;
+    //int knob_changed(Knob *) override;
 
     static Op* Build(Node* node) { return new DummyCamera(node); }
     static const Op::Description description;
@@ -49,20 +50,19 @@ void DummyCamera::_validate(bool for_real) {
     }
 
     CameraOp::_validate(for_real);
+
+    OutputContext test = this->outputContext();
+    auto gsv = test.graphScope();
+
+    auto me = gsv->data();
+    auto whattt = gsv->varNames();
+
 }
 
 void DummyCamera::knobs(Knob_Callback callback) {
     // TODO: add me custom knobs!
     //CameraOp::addProjectionKnobs(callback, false);
-    CameraOp::addLensKnobs(callback);
-}
-
-int DummyCamera::knob_changed(Knob* k) {
-    // TODO: implement custom knob changed
-    if (const auto* camera_input = Op::input0()->cameraOp()) {
-        return 1;
-    }
-    return 0;
+    //CameraOp::addLensKnobs(callback);
 }
 
 
