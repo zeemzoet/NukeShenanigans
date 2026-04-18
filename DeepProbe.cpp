@@ -37,7 +37,9 @@ public:
 
 void DeepProbe::_validate(bool for_real) {
     DeepPixelOp::_validate(for_real);
-    sample_deep_pixel();
+    input0()->op()->cached(cached());
+    if (for_real)
+        sample_deep_pixel();
 }
 
 void DeepProbe::append(Hash& hash) {
@@ -47,15 +49,14 @@ void DeepProbe::append(Hash& hash) {
 
 void DeepProbe::processSample(int y,
                                 int x,
-                                const DeepPixel &deepPixel,
+                                const DeepPixel &input_pixel,
                                 size_t sampleNo,
                                 const ChannelSet &channels,
-                                DeepOutPixel& output) const {
-
+                                DeepOutPixel& output_pixel) const {
     Pixel out_pixel(channels);
     foreach(z, channels) {
-        out_pixel[z] = deepPixel.getUnorderedSample(sampleNo, z);
-        output.push_back(out_pixel[z]);
+        out_pixel[z] = input_pixel.getUnorderedSample(sampleNo, z);
+        output_pixel.push_back(out_pixel[z]);
     }
 
 }
@@ -85,8 +86,7 @@ void DeepProbe::sample_deep_pixel() {
         deep_pixel_ = DummyDeepPixel(tmp_deep_plane.getPixel(y, x));
         knob("WidgetKnob")->changed();
     }
-
-    }
+}
 
 static Op* build(Node* node) { return new DeepProbe(node); }
 const Op::Description DeepProbe::description("DeepProbe", build);
