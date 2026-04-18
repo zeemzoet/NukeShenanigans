@@ -183,6 +183,7 @@ void DummyDeepPixel::draw(QPainter& painter, const float width, const float heig
         point_list << rect.topLeft();
 
         painter.setPen(QPen(QColor(red, green, blue), 1.0, Qt::SolidLine));
+        painter.setBrush(QBrush(QColor(red, green, blue)));
         painter.drawRect(rect);
     }
 
