@@ -41,33 +41,23 @@ bool DeepVolumise::doDeepEngine(const Box box, const ChannelSet& channels, DeepO
     output_plane.reserveSamples(input_plane.getTotalSampleCount());
 
     for (Box::iterator box_it = box.begin(); box_it != box.end(); ++box_it) {
-        const int x = box_it.x;
-        const int y = box_it.y;
+        DeepPixel input_pixel = input_plane.getPixel(box_it);
+        const size_t sample_count = input_pixel.getSampleCount();
 
-        DeepPixel input_pixel = input_plane.getPixel(y, x);
-        size_t input_samples = input_pixel.getSampleCount();
+        output_plane.setSampleCount(box_it, sample_count);
+        DeepOutputPixel output_pixel = output_plane.getPixel(box_it);
 
-        output_plane.setSampleCount(y, x, input_samples);
-        DeepOutputPixel output_pixel = output_plane.getPixel(y, x);
+        for (size_t s = 0; s < sample_count; ++s) {
+            const bool has_previous = static_cast<int>(s - 1) >= 0;
+            const float deep_back = has_previous
+                ? input_pixel.getOrderedSample(s - 1, Chan_DeepFront)
+                : input_pixel.getOrderedSample(s, Chan_DeepBack); // last sample: leave back unchanged
 
-        float previous_front_sample = 0.0f;
-        for (size_t sample = 0; sample < input_samples; ++sample) {
-            int next_sample = sample - 1;
-            if (next_sample >= 0) {
-                previous_front_sample = input_pixel.getOrderedSample(next_sample, Chan_DeepFront);
-            }
-            else {
-                previous_front_sample = input_pixel.getOrderedSample(sample, Chan_DeepBack);
-            }
             foreach(channel, channels) {
-                float& out_data = output_pixel.getWritableOrderedSample(sample, channel);
-                const float& in_data = input_pixel.getOrderedSample(sample, channel);
-                if (channel == Chan_DeepBack) {
-                    out_data = previous_front_sample;
-                }
-                else {
-                    out_data = in_data;
-                }
+                float& out_data = output_pixel.getWritableOrderedSample(s, channel);
+                out_data = (channel == Chan_DeepBack)
+                    ? deep_back
+                    : input_pixel.getOrderedSample(s, channel);
             }
         }
     }

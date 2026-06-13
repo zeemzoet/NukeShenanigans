@@ -5,7 +5,6 @@
 #include "DDImage/Knobs.h"
 #include "DDImage/Iop.h"
 #include "DDImage/DeepOp.h"
-#include "DDImage/CameraOp.h"
 
 #include <cmath>
 #include <valarray>
