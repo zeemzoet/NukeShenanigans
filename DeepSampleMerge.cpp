@@ -16,8 +16,8 @@ static const char* HELP = "Merge unnecessary deep samples";
 class DeepSampleMerge : public DeepFilterOp {
 
     bool _volumise { false };
-    bool _merge_opaque { false };
-    bool _use_distance_scaling { false };
+    bool _merge_opaque { true };
+    bool _use_distance_scaling { true };
     float _threshold {0.002f};
     Channel diagnostic_channel;
 
