@@ -13,12 +13,19 @@ using namespace DD::Image;
 static const char* CLASS = "DeepSampleMerge";
 static const char* HELP = "Merge unnecessary deep samples";
 
+struct SampleRange {
+    uint16_t first, last;
+
+    SampleRange(const int first, const int last) : first(first), last(last) {}
+};
+
 class DeepSampleMerge : public DeepFilterOp {
 
-    bool _volumise { false };
+    bool _volumise { true };
     bool _merge_opaque { true };
     bool _use_distance_scaling { true };
-    float _threshold {0.002f};
+    float _distance_threshold {0.05f};
+    float _alpha_threshold {0.125f};
     Channel diagnostic_channel;
 
     void merge_samples(DeepOutputPixel& , size_t, const DeepPixel&, size_t, size_t) const;
@@ -53,15 +60,28 @@ void DeepSampleMerge::_validate(bool for_real) {
 }
 
 void DeepSampleMerge::knobs(Knob_Callback f) {
-    Bool_knob(f, &_use_distance_scaling, "use_distance_scaling", "Scale Threshold by Distance");
+    Bool_knob(f, &_use_distance_scaling, "use_distance_scaling", "Scale Merge Distance by Depth");
+    Tooltip(f, "Increases the merge distance for samples further away, "
+               "allowing more aggressive merging at greater depths.");
     SetFlags(f, Knob::STARTLINE);
-    Float_knob(f, &_threshold, "Threshold");
+    Float_knob(f, &_distance_threshold, "dist_threshold", "Sample Merge Distance");
+    Tooltip(f, "Maximum distance between deep samples before they are merged together.");
+    SetFlags(f, Knob::LOG_SLIDER);
+    Float_knob(f, &_alpha_threshold, "alpha_threshold", "Alpha Merge Limit");
+    Tooltip(f, "Samples with alpha values above this threshold stop further merging, "
+               "helping preserve sharp opacity transitions.");
     BeginClosedGroup(f, "Advanced");
     SetFlags(f, Knob::STARTLINE);
-    Bool_knob(f, &_volumise, "volumise", "Volumise");
+    Bool_knob(f, &_volumise, "volumise", "Volumise Samples");
+    Tooltip(f, "Gives samples depth by extending their back position, "
+               "making them behave like volumetric data rather than flat surfaces.");
     SetFlags(f, Knob::STARTLINE);
     Bool_knob(f, &_merge_opaque, "merge_opaque", "Collapse Hidden Samples");
+    Tooltip(f, "Removes samples that are completely hidden behind opaque surfaces, "
+               "reducing unnecessary deep data.");
     Channel_knob(f, &diagnostic_channel, 1, "diagnostic_channel");
+    Tooltip(f, "Outputs merge information to the selected channel, "
+               "showing how many source samples contribute to each result.");
     EndGroup(f);
 }
 
@@ -85,11 +105,11 @@ bool DeepSampleMerge::doDeepEngine(Box box, const ChannelSet& channels, DeepOutp
     DeepInPlaceOutputPlane output_plane(output_channels, box);
     output_plane.reserveSamples(input_plane.getTotalSampleCount());
 
-    std::vector<std::pair<int, int>> samples_to_merge;
+    std::vector<SampleRange> samples_to_merge;
 
     for (Box::iterator box_it = box.begin(); box_it != box.end(); ++box_it) {
         DeepPixel input_pixel = input_plane.getPixel(box_it);
-        const size_t sample_count = input_pixel.getSampleCount();
+        const auto sample_count = static_cast<int>(input_pixel.getSampleCount());
 
         if (sample_count == 0) {
             output_plane.setSampleCount(box_it, 0);
@@ -121,7 +141,6 @@ bool DeepSampleMerge::doDeepEngine(Box box, const ChannelSet& channels, DeepOutp
             else
                 samples_to_merge.emplace_back(sample, sample);
         }
-
 #else
         for (int sample = 0; sample < sample_count; ++sample) {
             float alpha = input_pixel.getOrderedSample(sample, Chan_Alpha);
@@ -149,7 +168,6 @@ bool DeepSampleMerge::doDeepEngine(Box box, const ChannelSet& channels, DeepOutp
 
         size_t out_sample_index = 0;
         for (const auto& [lower, upper] : samples_to_merge) {
-            assert(lower >= 0);
             assert(upper < sample_count);
             merge_samples(output_pixel, out_sample_index, input_pixel, lower, upper);
             ++out_sample_index;
@@ -172,14 +190,23 @@ bool DeepSampleMerge::merge_error(const DeepPixel& deep_pixel, size_t lower_inde
 
     const float front_lower = deep_pixel.getOrderedSample(lower_index, Chan_DeepFront);
     const float front_upper = deep_pixel.getOrderedSample(upper_index, Chan_DeepFront);
+    const float back_lower = deep_pixel.getOrderedSample(lower_index, Chan_DeepBack);
+    const float back_upper = deep_pixel.getOrderedSample(upper_index, Chan_DeepBack);
 
-    const float distance_between = front_lower - front_upper;
-    const float average_depth = (front_lower + front_upper) / 2.0f;
+    const float alpha_lower = deep_pixel.getOrderedSample(lower_index, Chan_Alpha);
+    const float alpha_upper = deep_pixel.getOrderedSample(upper_index, Chan_Alpha);
 
-    if (_use_distance_scaling)
-        return distance_between < average_depth * _threshold;
+    const float distance_between = std::abs((front_lower+back_lower) - (front_upper+back_upper)) / 2;
+    const float average_depth = (front_lower + back_lower + front_upper + back_upper) / 4;
 
-    return distance_between < _threshold;
+    const bool alpha_threshold_met = (alpha_lower + alpha_upper) / 2 < _alpha_threshold;
+    const bool distance_threshold_met = distance_between < (
+        _use_distance_scaling
+        ? average_depth * _distance_threshold
+        : _distance_threshold
+    );
+
+    return alpha_threshold_met && distance_threshold_met;
 }
 
 
