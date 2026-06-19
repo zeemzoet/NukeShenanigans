@@ -5,6 +5,7 @@
 #include <DDImage/DeepFilterOp.h>
 #include <DDImage/Iop.h>
 #include <DDImage/Knobs.h>
+#include <DDImage/Row.h>
 
 using namespace DD::Image;
 
@@ -76,6 +77,7 @@ void DeepBind::_validate(bool for_real) {
 
 void DeepBind::getDeepRequests(Box box, const ChannelSet& channels, int count, std::vector<RequestData>& requests) {
     image_input()->request(box, channels, count);
+    deep_input()->deepRequest(box, Mask_Alpha, count);
 }
 
 
@@ -95,28 +97,36 @@ bool DeepBind::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPlane
     colour_channels -= Mask_Alpha;
     colour_channels -= Mask_Deep;
 
+    ChannelSet deep_channels = ChannelSet(Mask_Deep);
+
     DeepInPlaceOutputPlane output_plane(channels, box);
-    for (Box::iterator box_it = box.begin(); box_it != box.end(); ++box_it) {
-        DeepPixel input_pixel = input_plane.getPixel(box_it);
-        const size_t sample_count = input_pixel.getSampleCount();
 
-        output_plane.setSampleCount(box_it, sample_count);
-        DeepOutputPixel output_pixel = output_plane.getPixel(box_it);
+    // iterate over y
+    for (int y = box.y(); y < box.t(); ++y) {
 
-        float accumulated_transparency = 1.0f;
-        for (size_t s = 0; s < sample_count; ++s) {
-            float alpha = input_pixel.getOrderedSample(s, Chan_Alpha);
-            accumulated_transparency *= (1.0f - alpha);
+        Row input_row(box.x(), box.r());
+        image_input()->get(y, box.x(), box.r(), colour_channels, input_row);
 
-            foreach(channel, colour_channels) {
-                float value = image_input()->at(box_it.x, box_it.y, channel);
-                value *= alpha;
-                output_pixel.getWritableOrderedSample(s, channel) = value;
-            }
-            output_pixel.getWritableOrderedSample(s, Chan_Alpha) = alpha;
-            foreach(channel, ChannelSet(Mask_Deep)) {
-                output_pixel.getWritableOrderedSample(s, channel) =
-                    input_pixel.getOrderedSample(s, channel);
+        // iterate over x
+        for (int x = box.x(); x < box.r(); ++x) {
+
+            DeepPixel input_pixel = input_plane.getPixel(y, x);
+            const size_t sample_count = input_pixel.getSampleCount();
+
+            output_plane.setSampleCount(y, x, sample_count);
+            DeepOutputPixel output_pixel = output_plane.getPixel(y,x);
+
+            for (size_t s = 0; s < sample_count; ++s) {
+                const float alpha = input_pixel.getUnorderedSample(s, Chan_Alpha);
+                foreach(channel, colour_channels) {
+                    output_pixel.getWritableUnorderedSample(s, channel) =
+                        *(input_row[channel]+x) * alpha;
+                }
+                output_pixel.getWritableUnorderedSample(s, Chan_Alpha) = alpha;
+                foreach(channel, deep_channels) {
+                    output_pixel.getWritableUnorderedSample(s, channel) =
+                        input_pixel.getUnorderedSample(s, channel);
+                }
             }
         }
     }
