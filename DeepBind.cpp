@@ -8,6 +8,8 @@
 #include <DDImage/Row.h>
 #include <chrono>
 
+#define TIMINGS false
+
 using namespace DD::Image;
 
 static const char* CLASS = "DeepBind";
@@ -15,13 +17,28 @@ static const char* HELP = "Bind 2D and Deep data together";
 
 class DeepBind : public DeepFilterOp {
 
+    bool _remap_alpha;
+
+    static ChannelSet get_deep_channels() {
+        ChannelSet deep_channels(Mask_Deep);
+        deep_channels += Mask_Alpha;
+        return deep_channels;
+    }
+    [[nodiscard]] ChannelSet get_colour_channels(ChannelSet channels) const {
+        if (!_remap_alpha)
+            channels -= Mask_Alpha;
+        channels -= Mask_Deep;
+        return channels;
+    }
+
 public:
-    explicit DeepBind(Node* node) : DeepFilterOp(node) {}
+    explicit DeepBind(Node* node) : DeepFilterOp(node), _remap_alpha(true) {}
 
     void _validate(bool) override;
     void getDeepRequests(Box, const ChannelSet&, int, std::vector<RequestData>&) override;
-    //void knobs(Knob_Callback) override;
     bool doDeepEngine(Box, const ChannelSet&, DeepOutputPlane&) override;
+
+    void knobs(Knob_Callback) override;
 
     [[nodiscard]] int minimum_inputs() const override { return 2; }
     [[nodiscard]] int maximum_inputs() const override{ return 2; }
@@ -61,6 +78,10 @@ bool DeepBind::test_input(int input, Op* op) const {
     }
 }
 
+void DeepBind::knobs(Knob_Callback f) {
+    Bool_knob(f, &_remap_alpha, "use_input_alpha", "Use Input Alpha");
+}
+
 void DeepBind::_validate(bool for_real) {
     Box total_box = Box();
     ChannelSet total_channels(Mask_None);
@@ -86,15 +107,10 @@ void DeepBind::_validate(bool for_real) {
 
 void DeepBind::getDeepRequests(Box box, const ChannelSet& channels, int count, std::vector<RequestData>& requests) {
     if (const auto image = image_input()) {
-        ChannelSet colour_channels = channels;
-        colour_channels -= Mask_Alpha;
-        colour_channels -= Mask_Deep;
-        image->request(box, colour_channels, count);
+        image->request(box, get_colour_channels(channels), count);
     }
     if (const auto deep = deep_input()) {
-        ChannelSet deep_channels(Mask_Deep);
-        deep_channels += Mask_Alpha;
-        deep->deepRequest(box, deep_channels, count);
+        deep->deepRequest(box, get_deep_channels(), count);
     }
 }
 
@@ -111,13 +127,6 @@ bool DeepBind::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPlane
     if (!deep_input()->deepEngine(box, needed_channels, input_plane))
         return false;
 
-    ChannelSet colour_channels = channels;
-    colour_channels -= Mask_Alpha;
-    colour_channels -= Mask_Deep;
-
-    ChannelSet deep_channels(Mask_Deep);
-    deep_channels += Mask_Alpha;
-
     DeepInPlaceOutputPlane output_plane(channels, box);
 
     // precompute chanNo lookups once — outside all loops
@@ -130,15 +139,21 @@ bool DeepBind::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPlane
 
     // --- pointer table: input_data[z] points to sample 0 of channel z ---
     // one pointer per channel enum slot, stack allocated
-    std::vector<const float*> input_data(last_channel_index);
-    std::vector<float*> output_data(last_channel_index);
-    std::vector<float> alpha;
+    //std::vector<const float*> input_data(last_channel_index);
+    //std::vector<float*> output_data(last_channel_index);
+    const float* input_data[Chan_Last] = {nullptr};
+    float* output_data[Chan_Last] = {nullptr};
+    std::vector<float> alpha_samples;
 
     // iterate over y
     for (int y = box.y(); y < box.t(); ++y) {
 
         Row input_row(box.x(), box.r());
-        image_input()->get(y, box.x(), box.r(), colour_channels, input_row);
+        image_input()->get(y, box.x(), box.r(), get_colour_channels(channels), input_row);
+
+#if TIMINGS
+        auto t0 = std::chrono::high_resolution_clock::now();
+#endif
 
         // iterate over x
         for (int x = box.x(); x < box.r(); ++x) {
@@ -160,27 +175,60 @@ bool DeepBind::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPlane
             if (sample_count == 0)
                 continue;
 
-            if (alpha.size() < sample_count)
-                alpha.resize(sample_count);
+            if (alpha_samples.size() < sample_count)
+                alpha_samples.resize(sample_count);
 
             const float* a = input_data[Chan_Alpha];
-            for (size_t s = 0; s < sample_count; ++s)
-                alpha[s] = a[s * input_channel_size];
+            float total_transparency = 1.0f;
+            for (size_t s = 0; s < sample_count; ++s) {
+                float alpha = a[s * input_channel_size];
+                total_transparency *= (1.0f - alpha);
+                alpha_samples[s] = alpha;
+            }
 
-            foreach(z, deep_channels) {
+            const float image_alpha = input_row[Chan_Alpha][x];
+            const float alpha_scale = image_alpha / (1.0f - total_transparency);
+            if (_remap_alpha) {
+                float input_transparency = 1.0f;
+                float output_transparency = 1.0f;
+                for (size_t s = 0; s < sample_count; ++s) {
+                    input_transparency *= 1.0f - alpha_samples[s];
+
+                    float target_transparency = 1.0f - (1.0f - input_transparency) * alpha_scale;
+                    if (output_transparency > 1e-6f)
+                        alpha_samples[s] = 1.0f - target_transparency / output_transparency;
+                    else
+                        alpha_samples[s] = 1.0f;
+                    output_transparency = target_transparency;
+                }
+            }
+
+            foreach(z, ChannelSet(Mask_Deep)) {
                 const float* src = input_data[z];
                 float*       dst = output_data[z];
                 for (size_t s = 0; s < sample_count; ++s)
                     dst[s * output_channel_size] = src[s * input_channel_size];
             }
 
-            foreach(z, colour_channels) {
+            for (size_t s = 0; s < sample_count; ++s)
+                output_data[Chan_Alpha][s * output_channel_size] = alpha_samples[s];
+
+            foreach(z, get_colour_channels(channels)) {
                 const float row_val = input_row[z][x];
                 float*      dst     = output_data[z];
-                for (size_t s = 0; s < sample_count; ++s)
-                    dst[s * output_channel_size] = row_val * alpha[s];
+                for (size_t s = 0; s < sample_count; ++s) {
+                    if (_remap_alpha)
+                        dst[s * output_channel_size] = row_val / image_alpha * alpha_samples[s];
+                    else
+                        dst[s * output_channel_size] = row_val * alpha_samples[s];
+                }
             }
         }
+#if TIMINGS
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        printf("%f\n", ms);
+#endif
     }
 
     out = static_cast<DeepOutputPlane>(output_plane);
