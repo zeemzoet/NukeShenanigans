@@ -6,6 +6,7 @@
 #include <DDImage/Iop.h>
 #include <DDImage/Knobs.h>
 #include <DDImage/Row.h>
+#include <chrono>
 
 using namespace DD::Image;
 
@@ -13,7 +14,6 @@ static const char* CLASS = "DeepBind";
 static const char* HELP = "Bind 2D and Deep data together";
 
 class DeepBind : public DeepFilterOp {
-    ChannelSet _2D_Channels;
 
 public:
     explicit DeepBind(Node* node) : DeepFilterOp(node) {}
@@ -62,22 +62,40 @@ bool DeepBind::test_input(int input, Op* op) const {
 }
 
 void DeepBind::_validate(bool for_real) {
-    DeepFilterOp::_validate(for_real);
-    ChannelSet new_channels = _deepInfo.channels();
-    if (image_input()) {
-        image_input()->validate(true);
-        new_channels += image_input()->info().channels();
+    Box total_box = Box();
+    ChannelSet total_channels(Mask_None);
+    FormatPair total_formats = FormatPair();
+    if (const auto image = image_input()) {
+        image->validate(for_real);
+        const auto& info = image->info();
+
+        total_box.merge(info.box());
+        total_channels += info.channels();
+        total_formats = info.formats();
     }
-    _deepInfo = DeepInfo(
-        _deepInfo.formats(),
-        _deepInfo.box(),
-        new_channels
-    );
+    if (const auto deep = deep_input()) {
+        deep->validate(for_real);
+        const auto& deepinfo = deep->deepInfo();
+
+        total_box.merge(deepinfo.box());
+        total_channels += deepinfo.channels();
+        total_formats = deepinfo.formats();
+    }
+    _deepInfo = DeepInfo(total_formats, total_box, total_channels);
 }
 
 void DeepBind::getDeepRequests(Box box, const ChannelSet& channels, int count, std::vector<RequestData>& requests) {
-    image_input()->request(box, channels, count);
-    deep_input()->deepRequest(box, Mask_Alpha, count);
+    if (const auto image = image_input()) {
+        ChannelSet colour_channels = channels;
+        colour_channels -= Mask_Alpha;
+        colour_channels -= Mask_Deep;
+        image->request(box, colour_channels, count);
+    }
+    if (const auto deep = deep_input()) {
+        ChannelSet deep_channels(Mask_Deep);
+        deep_channels += Mask_Alpha;
+        deep->deepRequest(box, deep_channels, count);
+    }
 }
 
 
@@ -86,7 +104,7 @@ bool DeepBind::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPlane
         return false;
 
     DeepPlane input_plane;
-    ChannelSet needed_channels = channels;
+    ChannelSet needed_channels = ChannelSet();
     needed_channels += Mask_Alpha;
     needed_channels += Mask_Deep;
 
@@ -97,9 +115,24 @@ bool DeepBind::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPlane
     colour_channels -= Mask_Alpha;
     colour_channels -= Mask_Deep;
 
-    ChannelSet deep_channels = ChannelSet(Mask_Deep);
+    ChannelSet deep_channels(Mask_Deep);
+    deep_channels += Mask_Alpha;
 
     DeepInPlaceOutputPlane output_plane(channels, box);
+
+    // precompute chanNo lookups once — outside all loops
+    const size_t input_channel_size = input_plane.channels().size();
+    const size_t output_channel_size = channels.size();
+
+    // per-channel index table, built once
+    // indexed by channel enum, just like the reference code
+    const int last_channel_index = channels.last() + 1;
+
+    // --- pointer table: input_data[z] points to sample 0 of channel z ---
+    // one pointer per channel enum slot, stack allocated
+    std::vector<const float*> input_data(last_channel_index);
+    std::vector<float*> output_data(last_channel_index);
+    std::vector<float> alpha;
 
     // iterate over y
     for (int y = box.y(); y < box.t(); ++y) {
@@ -116,17 +149,36 @@ bool DeepBind::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPlane
             output_plane.setSampleCount(y, x, sample_count);
             DeepOutputPixel output_pixel = output_plane.getPixel(y,x);
 
-            for (size_t s = 0; s < sample_count; ++s) {
-                const float alpha = input_pixel.getUnorderedSample(s, Chan_Alpha);
-                foreach(channel, colour_channels) {
-                    output_pixel.getWritableUnorderedSample(s, channel) =
-                        *(input_row[channel]+x) * alpha;
-                }
-                output_pixel.getWritableUnorderedSample(s, Chan_Alpha) = alpha;
-                foreach(channel, deep_channels) {
-                    output_pixel.getWritableUnorderedSample(s, channel) =
-                        input_pixel.getUnorderedSample(s, channel);
-                }
+            const float* in_array  = input_pixel.data();
+            float*       out_array = output_pixel.writable();
+
+            foreach(z, channels) {
+                input_data[z]  = in_array  + input_plane.channels().chanNo(z);   // sample s is input_data[z][s * channel_size]
+                output_data[z] = out_array + output_plane.channels().chanNo(z);
+            }
+
+            if (sample_count == 0)
+                continue;
+
+            if (alpha.size() < sample_count)
+                alpha.resize(sample_count);
+
+            const float* a = input_data[Chan_Alpha];
+            for (size_t s = 0; s < sample_count; ++s)
+                alpha[s] = a[s * input_channel_size];
+
+            foreach(z, deep_channels) {
+                const float* src = input_data[z];
+                float*       dst = output_data[z];
+                for (size_t s = 0; s < sample_count; ++s)
+                    dst[s * output_channel_size] = src[s * input_channel_size];
+            }
+
+            foreach(z, colour_channels) {
+                const float row_val = input_row[z][x];
+                float*      dst     = output_data[z];
+                for (size_t s = 0; s < sample_count; ++s)
+                    dst[s * output_channel_size] = row_val * alpha[s];
             }
         }
     }
