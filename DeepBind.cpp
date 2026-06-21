@@ -31,6 +31,9 @@ class DeepBind : public DeepFilterOp {
         return channels;
     }
 
+    [[nodiscard]] Iop* image_input() const { return dynamic_cast<Iop*>(input(0)); }
+    [[nodiscard]] DeepOp* deep_input() const { return dynamic_cast<DeepOp*>(input(1)); }
+
 public:
     explicit DeepBind(Node* node) : DeepFilterOp(node), _remap_alpha(true) {}
 
@@ -44,9 +47,6 @@ public:
     [[nodiscard]] int maximum_inputs() const override{ return 2; }
     const char* input_label(int, char*) const override;
     bool test_input(int, Op*) const override;
-
-    [[nodiscard]] Iop* image_input() const { return dynamic_cast<Iop*>(input(0)); }
-    [[nodiscard]] DeepOp* deep_input() const { return dynamic_cast<DeepOp*>(input(1)); }
 
     static const Description description;
     [[nodiscard]] const char* Class() const override { return CLASS; }
@@ -144,6 +144,7 @@ bool DeepBind::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPlane
     const float* input_data[Chan_Last] = {nullptr};
     float* output_data[Chan_Last] = {nullptr};
     std::vector<float> alpha_samples;
+    alpha_samples.reserve(100);  //hoping for the best and not too many samples
 
     // iterate over y
     for (int y = box.y(); y < box.t(); ++y) {
@@ -186,7 +187,7 @@ bool DeepBind::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPlane
                 alpha_samples[s] = alpha;
             }
 
-            const float image_alpha = input_row[Chan_Alpha][x];
+            const float image_alpha = _remap_alpha ? input_row[Chan_Alpha][x] : 1.0f;
             const float alpha_scale = image_alpha / (1.0f - total_transparency);
             if (_remap_alpha) {
                 float input_transparency = 1.0f;
