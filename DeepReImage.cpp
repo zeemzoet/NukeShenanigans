@@ -12,10 +12,10 @@
 
 using namespace DD::Image;
 
-static const char* CLASS = "DeepBind";
+static const char* CLASS = "DeepReImage";
 static const char* HELP = "Bind 2D and Deep data together";
 
-class DeepBind : public DeepFilterOp {
+class DeepReImage : public DeepOnlyOp {
 
     bool _remap_alpha;
 
@@ -35,7 +35,7 @@ class DeepBind : public DeepFilterOp {
     [[nodiscard]] DeepOp* deep_input() const { return dynamic_cast<DeepOp*>(input(1)); }
 
 public:
-    explicit DeepBind(Node* node) : DeepFilterOp(node), _remap_alpha(true) {}
+    explicit DeepReImage(Node* node) : DeepOnlyOp(node), _remap_alpha(true) {}
 
     void _validate(bool) override;
     void getDeepRequests(Box, const ChannelSet&, int, std::vector<RequestData>&) override;
@@ -53,10 +53,10 @@ public:
     [[nodiscard]] const char* node_help() const override { return HELP; }
 };
 
-static Op* build(Node* node) { return new DeepBind(node); }
-const Op::Description DeepBind::description(CLASS, build);
+static Op* build(Node* node) { return new DeepReImage(node); }
+const Op::Description DeepReImage::description(CLASS, build);
 
-const char* DeepBind::input_label(int input, char* buffer) const {
+const char* DeepReImage::input_label(int input, char* buffer) const {
     switch (input) {
         case 0:
             return "colour";
@@ -67,7 +67,7 @@ const char* DeepBind::input_label(int input, char* buffer) const {
     }
 }
 
-bool DeepBind::test_input(int input, Op* op) const {
+bool DeepReImage::test_input(int input, Op* op) const {
     switch (input) {
         case 0:
             return dynamic_cast<Iop*>(op) != nullptr;
@@ -78,11 +78,11 @@ bool DeepBind::test_input(int input, Op* op) const {
     }
 }
 
-void DeepBind::knobs(Knob_Callback f) {
+void DeepReImage::knobs(Knob_Callback f) {
     Bool_knob(f, &_remap_alpha, "use_input_alpha", "Use Input Alpha");
 }
 
-void DeepBind::_validate(bool for_real) {
+void DeepReImage::_validate(bool for_real) {
     Box total_box = Box();
     ChannelSet total_channels(Mask_None);
     FormatPair total_formats = FormatPair();
@@ -105,7 +105,7 @@ void DeepBind::_validate(bool for_real) {
     _deepInfo = DeepInfo(total_formats, total_box, total_channels);
 }
 
-void DeepBind::getDeepRequests(Box box, const ChannelSet& channels, int count, std::vector<RequestData>& requests) {
+void DeepReImage::getDeepRequests(Box box, const ChannelSet& channels, int count, std::vector<RequestData>& requests) {
     if (const auto image = image_input()) {
         image->request(box, get_colour_channels(channels), count);
     }
@@ -115,7 +115,7 @@ void DeepBind::getDeepRequests(Box box, const ChannelSet& channels, int count, s
 }
 
 
-bool DeepBind::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPlane& out) {
+bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPlane& out) {
     if (!deep_input())
         return false;
 
@@ -133,18 +133,12 @@ bool DeepBind::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPlane
     const size_t input_channel_size = input_plane.channels().size();
     const size_t output_channel_size = channels.size();
 
-    // per-channel index table, built once
-    // indexed by channel enum, just like the reference code
-    const int last_channel_index = channels.last() + 1;
-
     // --- pointer table: input_data[z] points to sample 0 of channel z ---
     // one pointer per channel enum slot, stack allocated
-    //std::vector<const float*> input_data(last_channel_index);
-    //std::vector<float*> output_data(last_channel_index);
     const float* input_data[Chan_Last] = {nullptr};
     float* output_data[Chan_Last] = {nullptr};
     std::vector<float> alpha_samples;
-    alpha_samples.reserve(100);  //hoping for the best and not too many samples
+    alpha_samples.reserve(512);  //hoping for the best and not too many samples
 
     // iterate over y
     for (int y = box.y(); y < box.t(); ++y) {
@@ -168,18 +162,25 @@ bool DeepBind::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPlane
             const float* in_array  = input_pixel.data();
             float*       out_array = output_pixel.writable();
 
+            const ChannelMap& input_channelmap = input_plane.channels();
+            const ChannelMap& output_channelmap = output_plane.channels();
             foreach(z, channels) {
-                input_data[z]  = in_array  + input_plane.channels().chanNo(z);   // sample s is input_data[z][s * channel_size]
-                output_data[z] = out_array + output_plane.channels().chanNo(z);
+                if (input_channelmap.contains(z))
+                    input_data[z]  = in_array  + input_channelmap.chanNo(z);   // sample s is input_data[z][s * channel_size]
+                if (output_channelmap.contains(z))
+                    output_data[z] = out_array + output_channelmap.chanNo(z);
             }
 
             if (sample_count == 0)
                 continue;
 
+            const float* a = input_data[Chan_Alpha];
+            if (!a) continue;
+
+            // fingers crossed we don't often hit 512 samples.
             if (alpha_samples.size() < sample_count)
                 alpha_samples.resize(sample_count);
 
-            const float* a = input_data[Chan_Alpha];
             float total_transparency = 1.0f;
             for (size_t s = 0; s < sample_count; ++s) {
                 float alpha = a[s * input_channel_size];
@@ -217,12 +218,9 @@ bool DeepBind::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPlane
             foreach(z, get_colour_channels(channels)) {
                 const float row_val = input_row[z][x];
                 float*      dst     = output_data[z];
-                for (size_t s = 0; s < sample_count; ++s) {
-                    if (_remap_alpha)
-                        dst[s * output_channel_size] = row_val / image_alpha * alpha_samples[s];
-                    else
-                        dst[s * output_channel_size] = row_val * alpha_samples[s];
-                }
+                const float scaled_row_val = _remap_alpha ? row_val / image_alpha : row_val;
+                for (size_t s = 0; s < sample_count; ++s)
+                    dst[s * output_channel_size] = scaled_row_val * alpha_samples[s];
             }
         }
 #if TIMINGS

@@ -6,8 +6,6 @@
 #include <DDImage/Knobs.h>
 #include <vector>
 
-#define REVERSE 1
-
 using namespace DD::Image;
 
 static const char* CLASS = "DeepSampleMerge";
@@ -19,6 +17,13 @@ struct SampleRange {
     SampleRange(const int first, const int last) : first(first), last(last) {}
 };
 
+struct DeepPixelBuffer {
+    size_t input_channel_size {0};
+    size_t output_channel_size {0};
+    const float* input_data[Chan_Last] = {nullptr};
+    float* output_data[Chan_Last] = {nullptr};
+};
+
 class DeepSampleMerge : public DeepFilterOp {
 
     bool _volumise { true };
@@ -28,8 +33,8 @@ class DeepSampleMerge : public DeepFilterOp {
     float _alpha_threshold {0.125f};
     Channel diagnostic_channel;
 
-    void merge_samples(DeepOutputPixel& , size_t, const DeepPixel&, size_t, size_t) const;
-    [[nodiscard]] bool merge_error(const DeepPixel&, size_t, size_t) const;
+    void merge_samples(const DeepPixelBuffer&, size_t, ChannelMap&, size_t, size_t) const;
+    [[nodiscard]] bool merge_error(const DeepPixelBuffer&, size_t, size_t) const;
 
 public:
     explicit DeepSampleMerge(Node* node) : DeepFilterOp(node) {
@@ -105,6 +110,10 @@ bool DeepSampleMerge::doDeepEngine(Box box, const ChannelSet& channels, DeepOutp
     DeepInPlaceOutputPlane output_plane(output_channels, box);
     output_plane.reserveSamples(input_plane.getTotalSampleCount());
 
+    DeepPixelBuffer buffer;
+    buffer.input_channel_size = input_plane.channels().size();
+    buffer.output_channel_size = output_plane.channels().size();
+
     std::vector<SampleRange> samples_to_merge;
 
     for (Box::iterator box_it = box.begin(); box_it != box.end(); ++box_it) {
@@ -116,17 +125,27 @@ bool DeepSampleMerge::doDeepEngine(Box box, const ChannelSet& channels, DeepOutp
             continue;
         }
 
+        const float* in_array  = input_pixel.data();
+
+        const ChannelMap& input_channel_map = input_plane.channels();
+        foreach(z, channels) {
+            if (input_channel_map.contains(z))
+                buffer.input_data[z]  = in_array  + input_channel_map.chanNo(z);
+        }
+
+        const float* a = buffer.input_data[Chan_Alpha];
+        if(!a) continue;
+
         samples_to_merge.clear();
         samples_to_merge.reserve(sample_count);
 
         float accumulated_transparency = 1.0f;
-#if REVERSE
         for (int sample = sample_count - 1; sample >= 0; --sample) {
-            float alpha = input_pixel.getOrderedSample(sample, Chan_Alpha);
+            const float alpha = a[sample * buffer.input_channel_size];
             accumulated_transparency *= (1.0f - alpha);
 
             const bool extend_last_pair = !samples_to_merge.empty()
-                                        && merge_error(input_pixel, sample, sample + 1);
+                                        && merge_error(buffer, sample, sample + 1);
 
             const bool merge_when_opaque = !samples_to_merge.empty()
                                            && _merge_opaque
@@ -141,35 +160,19 @@ bool DeepSampleMerge::doDeepEngine(Box box, const ChannelSet& channels, DeepOutp
             else
                 samples_to_merge.emplace_back(sample, sample);
         }
-#else
-        for (int sample = 0; sample < sample_count; ++sample) {
-            float alpha = input_pixel.getOrderedSample(sample, Chan_Alpha);
-            accumulated_transparency *= (1.0f - alpha);
-
-            const bool extend_last_pair = !samples_to_merge.empty()
-                                        && merge_error(input_pixel, sample, sample + 1);
-
-            const bool merge_when_opaque = !samples_to_merge.empty()
-                                           && _merge_opaque
-                                           && accumulated_transparency < 1e-6;
-
-            if (merge_when_opaque) {
-                samples_to_merge.back().second = static_cast<int>(sample_count)-1;
-                break;
-            }
-            if (extend_last_pair)
-                samples_to_merge.back().second = sample;
-            else
-                samples_to_merge.emplace_back(sample, sample);
-        }
-#endif
         output_plane.setSampleCount(box_it, samples_to_merge.size());
         DeepOutputPixel output_pixel = output_plane.getPixel(box_it);
 
+        float* out_array = output_pixel.writable();
+        ChannelMap output_channel_map = output_plane.channels();
+        foreach(z, channels) {
+            if (output_channel_map.contains(z))
+                buffer.output_data[z] = out_array + output_channel_map.chanNo(z);
+        }
         size_t out_sample_index = 0;
         for (const auto& [lower, upper] : samples_to_merge) {
             assert(upper < sample_count);
-            merge_samples(output_pixel, out_sample_index, input_pixel, lower, upper);
+            merge_samples(buffer, out_sample_index, output_channel_map, lower, upper);
             ++out_sample_index;
         }
     }
@@ -180,21 +183,23 @@ bool DeepSampleMerge::doDeepEngine(Box box, const ChannelSet& channels, DeepOutp
     return true;
 }
 
-bool DeepSampleMerge::merge_error(const DeepPixel& deep_pixel, size_t lower_index, size_t upper_index) const {
-    const size_t sampleCount = deep_pixel.getSampleCount();
-    assert(sampleCount > 0);
+bool DeepSampleMerge::merge_error(const DeepPixelBuffer& buffer, size_t lower_index, size_t upper_index) const {
     assert(lower_index <= upper_index);
 
-    upper_index = std::min(upper_index, sampleCount - 1);
-    lower_index = std::min(lower_index, upper_index);
+    assert(buffer.input_data[Chan_DeepFront]);
+    assert(buffer.input_data[Chan_DeepBack]);
+    assert(buffer.input_data[Chan_Alpha]);
 
-    const float front_lower = deep_pixel.getOrderedSample(lower_index, Chan_DeepFront);
-    const float front_upper = deep_pixel.getOrderedSample(upper_index, Chan_DeepFront);
-    const float back_lower = deep_pixel.getOrderedSample(lower_index, Chan_DeepBack);
-    const float back_upper = deep_pixel.getOrderedSample(upper_index, Chan_DeepBack);
+    const size_t lower = lower_index * buffer.input_channel_size;
+    const size_t upper = upper_index * buffer.input_channel_size;
 
-    const float alpha_lower = deep_pixel.getOrderedSample(lower_index, Chan_Alpha);
-    const float alpha_upper = deep_pixel.getOrderedSample(upper_index, Chan_Alpha);
+    const float front_lower = buffer.input_data[Chan_DeepFront][lower];
+    const float front_upper = buffer.input_data[Chan_DeepFront][upper];
+    const float back_lower = buffer.input_data[Chan_DeepBack][lower];
+    const float back_upper = buffer.input_data[Chan_DeepBack][upper];
+
+    const float alpha_lower = buffer.input_data[Chan_Alpha][lower];
+    const float alpha_upper = buffer.input_data[Chan_Alpha][upper];
 
     const float distance_between = std::abs((front_lower+back_lower) - (front_upper+back_upper)) / 2;
     const float average_depth = (front_lower + back_lower + front_upper + back_upper) / 4;
@@ -209,42 +214,31 @@ bool DeepSampleMerge::merge_error(const DeepPixel& deep_pixel, size_t lower_inde
     return alpha_threshold_met && distance_threshold_met;
 }
 
-
-void DeepSampleMerge::merge_samples(
-    DeepOutputPixel& output_pixel,
-    const size_t out_index,
-    const DeepPixel& input_pixel,
-    const size_t lower_index,
-    const size_t upper_index)
-const {
-
-    const size_t sampleCount = input_pixel.getSampleCount();
-    assert(sampleCount > 0);
+void DeepSampleMerge::merge_samples(const DeepPixelBuffer& buffer, const size_t index, ChannelMap& channels, const size_t lower_index, const size_t upper_index) const {
     assert(lower_index <= upper_index);
 
-    ChannelSet other_channels(output_pixel.channels());
+    ChannelSet other_channels(channels);
     other_channels -= Chan_Alpha;
     other_channels -= Chan_DeepFront;
     other_channels -= Chan_DeepBack;
 
+    const size_t out_index = index * buffer.output_channel_size;
     float total_transparency = 1.0f;  //transparency = (1.0 - alpha)
-    for (auto i = lower_index; i <= upper_index; ++i) {
-        const float transparency = 1.0f - input_pixel.getOrderedSample(i, Chan_Alpha);
-        foreach(channel, other_channels) {
-            const float value = input_pixel.getOrderedSample(i, channel);
-            float& out_data = output_pixel.getWritableOrderedSample(out_index, channel);
-            out_data = transparency * out_data + value;
+    for(size_t s = lower_index; s <= upper_index; ++s) {
+        const float transparency = 1.0f - buffer.input_data[Chan_Alpha][s * buffer.input_channel_size];
+        foreach(z, other_channels) {
+            const float* src = buffer.input_data[z];
+            float*       dst = buffer.output_data[z];
+            dst[out_index] += src[s * buffer.input_channel_size] * total_transparency;
         }
         total_transparency *= transparency;
     }
-
-    output_pixel.getWritableOrderedSample(out_index, Chan_Alpha) = 1.0f - total_transparency;
+    buffer.output_data[Chan_Alpha][out_index] = 1.0f - total_transparency;
     if (diagnostic_channel != Chan_Black)
-        output_pixel.getWritableOrderedSample(out_index, diagnostic_channel) = static_cast<float>(upper_index-lower_index);
-    output_pixel.getWritableOrderedSample(out_index, Chan_DeepFront) = input_pixel.getOrderedSample(upper_index, Chan_DeepFront);
-    float& out_deep_back_data = output_pixel.getWritableOrderedSample(out_index, Chan_DeepBack);
-    if (_volumise)
-        out_deep_back_data = input_pixel.getOrderedSample(lower_index, Chan_DeepBack);
-    else
-        out_deep_back_data = input_pixel.getOrderedSample(upper_index, Chan_DeepFront);
+        buffer.output_data[diagnostic_channel][out_index] = static_cast<float>(upper_index-lower_index);
+
+    buffer.output_data[Chan_DeepFront][out_index] = buffer.input_data[Chan_DeepFront][upper_index * buffer.input_channel_size];
+    buffer.output_data[Chan_DeepBack][out_index] = _volumise
+                                                ? buffer.input_data[Chan_DeepBack][lower_index * buffer.input_channel_size]
+                                                : buffer.input_data[Chan_DeepFront][upper_index * buffer.input_channel_size];
 }
