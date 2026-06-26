@@ -165,7 +165,7 @@ bool DeepSampleMerge::doDeepEngine(Box box, const ChannelSet& channels, DeepOutp
 
         float* out_array = output_pixel.writable();
         ChannelMap output_channel_map = output_plane.channels();
-        foreach(z, channels) {
+        foreach(z, output_channels) {
             if (output_channel_map.contains(z))
                 buffer.output_data[z] = out_array + output_channel_map.chanNo(z);
         }
@@ -221,6 +221,7 @@ void DeepSampleMerge::merge_samples(const DeepPixelBuffer& buffer, const size_t 
     other_channels -= Chan_Alpha;
     other_channels -= Chan_DeepFront;
     other_channels -= Chan_DeepBack;
+    other_channels -= diagnostic_channel;
 
     const size_t out_index = index * buffer.output_channel_size;
     float total_transparency = 1.0f;  //transparency = (1.0 - alpha)
