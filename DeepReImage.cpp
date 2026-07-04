@@ -15,19 +15,28 @@ using namespace DD::Image;
 static const char* CLASS = "DeepReImage";
 static const char* HELP = "Bind 2D and Deep data together";
 
+static const char* const bbox_names[] = {
+    "union", "image", "deep", nullptr
+};
+
 class DeepReImage : public DeepOp, public Iop {
 
+    bool _combine;
     bool _remap_alpha;
-    ChannelSet _2D_channels;
+    ChannelSet _channels;
 
-    static ChannelSet get_deep_channels() {
-        ChannelSet deep_channels(Mask_Deep);
-        deep_channels += Mask_Alpha;
-        return deep_channels;
+    enum {UNION, IMAGE, DEEP};
+    int _bbox_type;
+
+    static ChannelSet get_deep_channels(const ChannelSet& channels) {
+        ChannelSet new_channels(channels);
+        new_channels += Mask_Deep;
+        new_channels += Mask_Alpha;
+        return new_channels;
     }
     [[nodiscard]] ChannelSet get_colour_channels(const ChannelSet& channels, const bool with_alpha=false) const {
         ChannelSet new_channels(channels);
-        new_channels &= _2D_channels;
+        new_channels &= _channels;
         if (!_remap_alpha && !with_alpha)
             new_channels -= Mask_Alpha;
         new_channels -= Mask_Deep;
@@ -38,7 +47,12 @@ class DeepReImage : public DeepOp, public Iop {
     [[nodiscard]] DeepOp* deep_input() const { return dynamic_cast<DeepOp*>(Op::input(1)); }
 
 public:
-    explicit DeepReImage(Node* node) : Iop(node), _remap_alpha(true), _2D_channels(Mask_All) {}
+    explicit DeepReImage(Node* node) : Iop(node)
+    , _combine(true)
+    , _remap_alpha(true)
+    , _channels(Mask_All)
+    , _bbox_type(UNION)
+    {}
 
     // Deep stuff
     Op* op() override { return this; }
@@ -88,12 +102,14 @@ bool DeepReImage::test_input(int input, Op* op) const {
 }
 
 void DeepReImage::knobs(Knob_Callback f) {
+    Input_ChannelMask_knob(f, &_channels, 0, "channels");
+    SetFlags(f, Knob::STARTLINE);
+    Bool_knob(f, &_combine, "combine_deep", "Combine");
     Bool_knob(f, &_remap_alpha, "use_image_alpha", "Use Image Alpha");
-    ChannelMask_knob(f, &_2D_channels, "channels");
+    Enumeration_knob(f, &_bbox_type, bbox_names, "bbox", "Set BBox to");
 }
 
 void DeepReImage::_validate(bool for_real) {
-    //TODO : add bbox logic (union, intersect, etc)
     Box total_box = Box();
     ChannelSet total_channels(Mask_None);
     FormatPair total_formats = FormatPair();
@@ -101,34 +117,49 @@ void DeepReImage::_validate(bool for_real) {
         image->validate(for_real);
         const auto& info = image->info();
 
-        copy_info(0, _2D_channels);
-
-        total_box.merge(info.box());
+        switch (_bbox_type) {
+            case UNION:
+                total_box.merge(info.box());
+                break;
+            case IMAGE:
+                total_box = info.box();
+                break;
+            default: ;
+        }
         total_formats = info.formats();
     }
     if (const auto deep = deep_input()) {
         deep->validate(for_real);
         const auto& deepinfo = deep->deepInfo();
-
-        total_box.merge(deepinfo.box());
+        switch (_bbox_type) {
+            case UNION:
+                total_box.merge(deepinfo.box());
+                break;
+            case DEEP:
+                total_box = deepinfo.box();
+                break;
+            default: ;
+        }
         total_formats = deepinfo.formats();
     }
-    _deepInfo = DeepInfo(total_formats, total_box, _2D_channels);
+    info_.merge(total_box);
+    info_.setFormats(total_formats);
+    info_.channels() = _channels + Mask_Deep;
+    _deepInfo = DeepInfo(info_);
 }
 
 void DeepReImage::getDeepRequests(Box box, const ChannelSet& channels, int count, std::vector<RequestData>& requests) {
     if (const auto image = image_input())
         image->request(box, get_colour_channels(channels), count);
     if (const auto deep = deep_input())
-        deep->deepRequest(box, get_deep_channels(), count);
+        deep->deepRequest(box, get_deep_channels(channels), count);
 }
 
 void DeepReImage::_request(int x, int y, int r, int t, ChannelMask channels, int count) {
     if (const auto image = image_input())
         image->request(x, y, r, t, get_colour_channels(channels), count);
-    if (const auto deep = deep_input()) {
-        deep->deepRequest(Box(x,y,r,t), get_deep_channels(), count);
-    }
+    if (const auto deep = deep_input())
+        deep->deepRequest(Box(x,y,r,t), get_deep_channels(channels), count);
 }
 
 bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPlane& out) {
@@ -136,11 +167,7 @@ bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPl
         return false;
 
     DeepPlane input_plane;
-    ChannelSet needed_channels = ChannelSet();
-    needed_channels += Mask_Alpha;
-    needed_channels += Mask_Deep;
-
-    if (!deep_input()->deepEngine(box, needed_channels, input_plane))
+    if (!deep_input()->deepEngine(box, get_deep_channels(channels), input_plane))
         return false;
 
     DeepInPlaceOutputPlane output_plane(channels, box);
@@ -153,6 +180,43 @@ bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPl
     // one pointer per channel enum slot, stack allocated
     const float* input_data[Chan_Last] = {nullptr};
     float* output_data[Chan_Last] = {nullptr};
+
+    if (!_combine) {
+        for (Box::iterator it = box.begin(); it != box.end(); ++it) {
+            DeepPixel input_pixel = input_plane.getPixel(it);
+            const size_t sample_count = input_pixel.getSampleCount();
+
+            output_plane.setSampleCount(it, sample_count);
+            DeepOutputPixel output_pixel = output_plane.getPixel(it);
+
+            const float* in_array  = input_pixel.data();
+            float*       out_array = output_pixel.writable();
+
+            const ChannelMap& input_channel_map = input_plane.channels();
+            const ChannelMap& output_channel_map = output_plane.channels();
+            foreach(z, channels) {
+                if (input_channel_map.contains(z))
+                    input_data[z]  = in_array  + input_channel_map.chanNo(z);   // sample s is input_data[z][s * channel_size]
+                if (output_channel_map.contains(z))
+                    output_data[z] = out_array + output_channel_map.chanNo(z);
+            }
+
+            if (sample_count == 0)
+                continue;
+
+            foreach(z, channels) {
+                const float* src = input_data[z];
+                float*       dst = output_data[z];
+                for (size_t s = 0; s < sample_count; ++s) {
+                    float value = src ? src[s * input_channel_size] : 0.0f;
+                    dst[s * output_channel_size] = value;
+                }
+            }
+        }
+        out = static_cast<DeepOutputPlane>(output_plane);
+        return true;
+    }
+
     std::vector<float> alpha_samples;
     alpha_samples.reserve(512);  //hoping for the best and not too many samples
 
@@ -224,8 +288,10 @@ bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPl
             foreach(z, ChannelSet(Mask_Deep)) {
                 const float* src = input_data[z];
                 float*       dst = output_data[z];
-                for (size_t s = 0; s < sample_count; ++s)
-                    dst[s * output_channel_size] = src[s * input_channel_size];
+                for (size_t s = 0; s < sample_count; ++s) {
+                    float value = src ? src[s * input_channel_size] : 0.0f;
+                    dst[s * output_channel_size] = value;
+                }
             }
 
             for (size_t s = 0; s < sample_count; ++s)
@@ -247,11 +313,14 @@ bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPl
     }
 
     out = static_cast<DeepOutputPlane>(output_plane);
-
     return true;
 }
 
 void DeepReImage::engine(int y, int x, int r, ChannelMask channels, Row& out_row) {
+    if (!_combine) {
+        image_input()->engine(y, x, r, channels, out_row);
+        return;
+    }
     if (!deep_input()) {
         foreach(z, channels)
             out_row.erase(z);
@@ -259,7 +328,7 @@ void DeepReImage::engine(int y, int x, int r, ChannelMask channels, Row& out_row
     }
 
     DeepPlane input_plane;
-    if (!deep_input()->deepEngine(y, x, r, get_deep_channels(), input_plane)) {
+    if (!deep_input()->deepEngine(y, x, r, channels, input_plane)) {
         abort();
         foreach(z, channels) {
             out_row.erase(z);
