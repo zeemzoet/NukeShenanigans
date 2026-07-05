@@ -11,6 +11,10 @@ using namespace DD::Image;
 static const char* CLASS = "DeepSampleMerge";
 static const char* HELP = "Merge unnecessary deep samples";
 
+static const char* const algorithms_names[] = {
+    "Simple", "Fancy (Douglas-Pecker)", nullptr
+};
+
 struct SampleRange {
     uint16_t first, last;
     SampleRange(const int first, const int last) : first(first), last(last) {
@@ -21,6 +25,13 @@ struct SampleRange {
     }
 };
 
+struct DeepPlotSample {
+    float x, y;
+    DeepPlotSample(const float x, const float y) : x(x), y(y) {}
+};
+
+static void ramer_douglas_peucker(const std::vector<DeepPlotSample>&, int, int, float, std::vector<char>&);
+
 struct DeepPixelBuffer {
     size_t input_channel_size {0};
     size_t output_channel_size {0};
@@ -30,15 +41,22 @@ struct DeepPixelBuffer {
 
 class DeepSampleMerge : public DeepFilterOp {
 
-    bool _volumise { true };
-    bool _merge_opaque { true };
+    enum {SIMPLE, RDP};
+    int _algorithm_choice {RDP};
+
     bool _use_distance_scaling { true };
     float _distance_threshold {0.05f};
     float _alpha_threshold {0.125f};
+
+    float _rdp_epsilon {0.1f};
+
+    bool _volumise { true };
+    bool _merge_opaque { true };
     Channel _diagnostic_channel;
 
     void merge_samples(const DeepPixelBuffer&, size_t, const ChannelMap&, size_t, size_t) const;
-    [[nodiscard]] std::vector<SampleRange> should_merge_distance_alpha(const DeepPixelBuffer&, int) const;
+    void should_merge_distance_alpha(std::vector<SampleRange>&, const DeepPixelBuffer&, int) const;
+    void should_merge_RDP(std::vector<SampleRange>&, const DeepPixelBuffer&, int) const;
 
 public:
     explicit DeepSampleMerge(Node* node) : DeepFilterOp(node) {
@@ -47,6 +65,7 @@ public:
 
     void _validate(bool) override;
     void knobs(Knob_Callback) override;
+    int knob_changed(Knob *) override;
     void append(Hash&) override;
     bool doDeepEngine(Box, const ChannelSet&, DeepOutputPlane&) override;
 
@@ -88,11 +107,7 @@ void DeepSampleMerge::merge_samples(const DeepPixelBuffer &buffer, const size_t 
                                                        : buffer.input_data[Chan_DeepFront][upper_index * buffer.input_channel_size];
 }
 
-std::vector<SampleRange> DeepSampleMerge::should_merge_distance_alpha(const DeepPixelBuffer& buffer, const int sample_count) const {
-    std::vector<SampleRange> samples_to_merge;
-    samples_to_merge.reserve(sample_count);
-    const float* alpha_buffer = buffer.input_data[Chan_Alpha];
-
+void DeepSampleMerge::should_merge_distance_alpha(std::vector<SampleRange>& samples_to_merge, const DeepPixelBuffer& buffer, const int sample_count) const {
     auto should_merge = [&](size_t lower_index, size_t upper_index) {
         assert(lower_index <= upper_index);
 
@@ -124,6 +139,7 @@ std::vector<SampleRange> DeepSampleMerge::should_merge_distance_alpha(const Deep
         return alpha_threshold_met && distance_threshold_met;
     };
 
+    const float* alpha_buffer = buffer.input_data[Chan_Alpha];
     float accumulated_transparency = 1.0f;
     for (int sample = sample_count - 1; sample >= 0; --sample) {
         const float alpha = alpha_buffer[sample * buffer.input_channel_size];
@@ -145,10 +161,44 @@ std::vector<SampleRange> DeepSampleMerge::should_merge_distance_alpha(const Deep
         else
             samples_to_merge.emplace_back(sample, sample);
     }
-
-    return samples_to_merge;
 }
 
+void DeepSampleMerge::should_merge_RDP(std::vector<SampleRange>& samples_to_merge, const DeepPixelBuffer& buffer, int sample_count) const {
+    // First we make a graph, plotting the deep samples.
+    std::vector<DeepPlotSample> deep_plotted;
+    deep_plotted.reserve(sample_count * 2); // *2 because a deep back sample could be different than a deep front.
+    for (int sample = 0; sample < sample_count; ++sample) {
+        const size_t sample_index = sample * buffer.input_channel_size;
+
+        const float front = buffer.input_data[Chan_DeepFront][sample_index];
+        const float back = buffer.input_data[Chan_DeepBack][sample_index];
+
+        const float alpha = buffer.input_data[Chan_Alpha][sample_index];
+
+        deep_plotted.emplace_back(front, alpha);
+        if (front != back)
+            deep_plotted.emplace_back(back, alpha);
+    }
+
+    int deep_plotted_size = static_cast<int>(deep_plotted.size());
+    if (deep_plotted.size() < 3) {
+        for (int i = 0; i < deep_plotted_size; ++i)
+            samples_to_merge.emplace_back(i, i);
+        return;
+    }
+
+    std::vector<char> keep(deep_plotted.size(), 0);
+    keep[0] = 1;
+    keep[deep_plotted_size - 1] = 1;
+
+    ramer_douglas_peucker(deep_plotted, 0, deep_plotted_size - 1, _rdp_epsilon, keep);
+    for (int i = 0; i < deep_plotted_size; ++i) {
+        if (keep[i])
+            samples_to_merge.emplace_back(i, i);
+        else
+            samples_to_merge.back().last = i;
+    }
+}
 
 void DeepSampleMerge::_validate(bool for_real) {
     DeepFilterOp::_validate(for_real);
@@ -164,30 +214,54 @@ void DeepSampleMerge::_validate(bool for_real) {
 }
 
 void DeepSampleMerge::knobs(Knob_Callback f) {
-    Bool_knob(f, &_use_distance_scaling, "use_distance_scaling", "Scale Merge Distance by Depth");
-    Tooltip(f, "Increases the merge distance for samples further away, "
-            "allowing more aggressive merging at greater depths.");
-    SetFlags(f, Knob::STARTLINE);
-    Float_knob(f, &_distance_threshold, "dist_threshold", "Sample Merge Distance");
+    Enumeration_knob(f, &_algorithm_choice, algorithms_names, "method", "Method");
+
+    const auto dist_knob = Float_knob(f, &_distance_threshold, "dist_threshold", "Sample Merge Distance");
+    dist_knob->visible(_algorithm_choice == SIMPLE);
     Tooltip(f, "Maximum distance between deep samples before they are merged together.");
     SetFlags(f, Knob::LOG_SLIDER);
-    Float_knob(f, &_alpha_threshold, "alpha_threshold", "Alpha Merge Limit");
+    const auto dist_scaling_knob = Bool_knob(f, &_use_distance_scaling, "use_distance_scaling", "Scale Merge Distance by Depth");
+    dist_scaling_knob->visible(_algorithm_choice == SIMPLE);
+    Tooltip(f, "Increases the merge distance for samples further away, "
+            "allowing more aggressive merging at greater depths.");
+    const auto alpha_knob = Float_knob(f, &_alpha_threshold, "alpha_threshold", "Alpha Merge Limit");
+    alpha_knob->visible(_algorithm_choice == SIMPLE);
     Tooltip(f, "Samples with alpha values above this threshold stop further merging, "
             "helping preserve sharp opacity transitions.");
+    const auto opaque_knob = Bool_knob(f, &_merge_opaque, "merge_opaque", "Collapse Hidden Samples");
+    opaque_knob->visible(_algorithm_choice == SIMPLE);
+    Tooltip(f, "Removes samples that are completely hidden behind opaque surfaces, "
+            "reducing unnecessary deep data.");
+
+    const auto rdp_knob = Float_knob(f, &_rdp_epsilon, "rdp_epsilon", "RDP epsilon");
+    rdp_knob->visible(_algorithm_choice == RDP);
+
     BeginClosedGroup(f, "Advanced");
     SetFlags(f, Knob::STARTLINE);
     Bool_knob(f, &_volumise, "volumise", "Volumise Samples");
     Tooltip(f, "Gives samples depth by extending their back position, "
             "making them behave like volumetric data rather than flat surfaces.");
     SetFlags(f, Knob::STARTLINE);
-    Bool_knob(f, &_merge_opaque, "merge_opaque", "Collapse Hidden Samples");
-    Tooltip(f, "Removes samples that are completely hidden behind opaque surfaces, "
-            "reducing unnecessary deep data.");
+
     Channel_knob(f, &_diagnostic_channel, 1, "diagnostic_channel");
     Tooltip(f, "Outputs merge information to the selected channel, "
             "showing how many source samples contribute to each result.");
     EndGroup(f);
 }
+
+int DeepSampleMerge::knob_changed(Knob* k) {
+    if (k->is("method")) {
+        knob("dist_threshold")->visible(_algorithm_choice == SIMPLE);
+        knob("use_distance_scaling")->visible(_algorithm_choice == SIMPLE);
+        knob("alpha_threshold")->visible(_algorithm_choice == SIMPLE);
+        knob("merge_opaque")->visible(_algorithm_choice == SIMPLE);
+
+        knob("rdp_epsilon")->visible(_algorithm_choice == RDP);
+        return 1;
+    }
+    return 0;
+}
+
 
 void DeepSampleMerge::append(Hash& hash) {
     hash.append(_use_distance_scaling);
@@ -238,11 +312,19 @@ bool DeepSampleMerge::doDeepEngine(Box box, const ChannelSet& channels, DeepOutp
                 buffer.input_data[z]  = in_array  + input_channel_map.chanNo(z);
         }
 
-        const float* alpha_buffer = buffer.input_data[Chan_Alpha];
-        if (!alpha_buffer) continue;
+        if (!buffer.input_data[Chan_Alpha]) continue;
 
         std::vector<SampleRange> samples_to_merge;
-        samples_to_merge = should_merge_distance_alpha(buffer, sample_count);
+        samples_to_merge.reserve(sample_count);
+        switch (_algorithm_choice) {
+            case SIMPLE:
+                should_merge_distance_alpha(samples_to_merge, buffer, sample_count);
+                break;
+            case RDP:
+                should_merge_RDP(samples_to_merge, buffer, sample_count);
+                break;
+            default: ;
+        }
         output_plane.setSampleCount(box_it, samples_to_merge.size());
         DeepOutputPixel output_pixel = output_plane.getPixel(box_it);
 
@@ -267,3 +349,47 @@ bool DeepSampleMerge::doDeepEngine(Box box, const ChannelSet& channels, DeepOutp
 }
 
 const Op::Description DeepSampleMerge::description(CLASS, build);
+
+static float point_line_distance(const DeepPlotSample& point, const DeepPlotSample& a, const DeepPlotSample& b) {
+    float v_x = b.x - a.x;
+    float v_y = b.y - a.y;
+
+    if (v_x == 0.0f && v_y == 0.0f)
+        return std::hypot(point.x - a.x, point.y - a.y);
+
+    float t = ((point.x - a.x)* v_x + (point.y - a.y)* v_y) / (v_x * v_x + v_y * v_y);
+    t = std::max(0.0f, std::min(1.0f, t));
+
+    float proj_x = a.x + t * v_x;
+    float proj_y = a.y + t * v_y;
+
+    float d_x = point.x - proj_x;
+    float d_y = point.y - proj_y;
+
+    return std::sqrt(d_x * d_x + d_y * d_y);
+}
+
+static void ramer_douglas_peucker(const std::vector<DeepPlotSample>& deep_samples, int start, int end, float epsilon, std::vector<char>& keep) {
+    if (end <= start + 1)
+        return;
+
+    float max_distance = 0.0f;
+    int index = -1;
+
+    const DeepPlotSample& start_sample = deep_samples[start];
+    const DeepPlotSample& end_sample = deep_samples[end];
+
+    for (int i = start + 1; i < end; ++i) {
+        float distance = point_line_distance(deep_samples[i], start_sample, end_sample);
+        if (distance > max_distance) {
+            max_distance = distance;
+            index = i;
+        }
+    }
+
+    if (max_distance > epsilon) {
+        keep[index] = 1;
+        ramer_douglas_peucker(deep_samples, start, index, epsilon, keep);
+        ramer_douglas_peucker(deep_samples, index, end, epsilon, keep);
+    }
+}
