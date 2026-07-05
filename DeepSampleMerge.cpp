@@ -38,7 +38,7 @@ class DeepSampleMerge : public DeepFilterOp {
     Channel _diagnostic_channel;
 
     void merge_samples(const DeepPixelBuffer&, size_t, const ChannelMap&, size_t, size_t) const;
-    [[nodiscard]] bool merge_error(const DeepPixelBuffer&, size_t, size_t) const;
+    [[nodiscard]] std::vector<SampleRange> should_merge_distance_alpha(const DeepPixelBuffer&, int) const;
 
 public:
     explicit DeepSampleMerge(Node* node) : DeepFilterOp(node) {
@@ -88,36 +88,67 @@ void DeepSampleMerge::merge_samples(const DeepPixelBuffer &buffer, const size_t 
                                                        : buffer.input_data[Chan_DeepFront][upper_index * buffer.input_channel_size];
 }
 
-bool DeepSampleMerge::merge_error(const DeepPixelBuffer& buffer, size_t lower_index, size_t upper_index) const {
-    assert(lower_index <= upper_index);
+std::vector<SampleRange> DeepSampleMerge::should_merge_distance_alpha(const DeepPixelBuffer& buffer, const int sample_count) const {
+    std::vector<SampleRange> samples_to_merge;
+    samples_to_merge.reserve(sample_count);
+    const float* alpha_buffer = buffer.input_data[Chan_Alpha];
 
-    assert(buffer.input_data[Chan_DeepFront]);
-    assert(buffer.input_data[Chan_DeepBack]);
-    assert(buffer.input_data[Chan_Alpha]);
+    auto should_merge = [&](size_t lower_index, size_t upper_index) {
+        assert(lower_index <= upper_index);
 
-    const size_t lower = lower_index * buffer.input_channel_size;
-    const size_t upper = upper_index * buffer.input_channel_size;
+        assert(buffer.input_data[Chan_DeepFront]);
+        assert(buffer.input_data[Chan_DeepBack]);
+        assert(buffer.input_data[Chan_Alpha]);
 
-    const float front_lower = buffer.input_data[Chan_DeepFront][lower];
-    const float front_upper = buffer.input_data[Chan_DeepFront][upper];
-    const float back_lower = buffer.input_data[Chan_DeepBack][lower];
-    const float back_upper = buffer.input_data[Chan_DeepBack][upper];
+        const size_t lower = lower_index * buffer.input_channel_size;
+        const size_t upper = upper_index * buffer.input_channel_size;
 
-    const float alpha_lower = buffer.input_data[Chan_Alpha][lower];
-    const float alpha_upper = buffer.input_data[Chan_Alpha][upper];
+        const float front_lower = buffer.input_data[Chan_DeepFront][lower];
+        const float front_upper = buffer.input_data[Chan_DeepFront][upper];
+        const float back_lower = buffer.input_data[Chan_DeepBack][lower];
+        const float back_upper = buffer.input_data[Chan_DeepBack][upper];
 
-    const float distance_between = std::abs((front_lower+back_lower) - (front_upper+back_upper)) / 2;
-    const float average_depth = (front_lower + back_lower + front_upper + back_upper) / 4;
+        const float alpha_lower = buffer.input_data[Chan_Alpha][lower];
+        const float alpha_upper = buffer.input_data[Chan_Alpha][upper];
 
-    const bool alpha_threshold_met = (alpha_lower + alpha_upper) / 2 < _alpha_threshold;
-    const bool distance_threshold_met = distance_between < (
-                                            _use_distance_scaling
-                                                ? average_depth * _distance_threshold
-                                                : _distance_threshold
-                                        );
+        const float distance_between = std::abs((front_lower+back_lower) - (front_upper+back_upper)) / 2;
+        const float average_depth = (front_lower + back_lower + front_upper + back_upper) / 4;
 
-    return alpha_threshold_met && distance_threshold_met;
+        const bool alpha_threshold_met = (alpha_lower + alpha_upper) / 2 < _alpha_threshold;
+        const bool distance_threshold_met = distance_between < (
+                                                _use_distance_scaling
+                                                    ? average_depth * _distance_threshold
+                                                    : _distance_threshold
+                                            );
+
+        return alpha_threshold_met && distance_threshold_met;
+    };
+
+    float accumulated_transparency = 1.0f;
+    for (int sample = sample_count - 1; sample >= 0; --sample) {
+        const float alpha = alpha_buffer[sample * buffer.input_channel_size];
+        accumulated_transparency *= (1.0f - alpha);
+
+        const bool extend_last_pair = !samples_to_merge.empty()
+                                      && should_merge(sample, sample + 1);
+
+        const bool merge_when_opaque = !samples_to_merge.empty()
+                                       && _merge_opaque
+                                       && accumulated_transparency < 1e-6;
+
+        if (merge_when_opaque) {
+            samples_to_merge.back().first = 0;
+            break;
+        }
+        if (extend_last_pair)
+            samples_to_merge.back().first = sample;
+        else
+            samples_to_merge.emplace_back(sample, sample);
+    }
+
+    return samples_to_merge;
 }
+
 
 void DeepSampleMerge::_validate(bool for_real) {
     DeepFilterOp::_validate(for_real);
@@ -191,8 +222,6 @@ bool DeepSampleMerge::doDeepEngine(Box box, const ChannelSet& channels, DeepOutp
     buffer.input_channel_size = input_plane.channels().size();
     buffer.output_channel_size = output_plane.channels().size();
 
-    std::vector<SampleRange> samples_to_merge;
-
     for (Box::iterator box_it = box.begin(); box_it != box.end(); ++box_it) {
         DeepPixel input_pixel = input_plane.getPixel(box_it);
         const auto sample_count = static_cast<int>(input_pixel.getSampleCount());
@@ -212,30 +241,8 @@ bool DeepSampleMerge::doDeepEngine(Box box, const ChannelSet& channels, DeepOutp
         const float* alpha_buffer = buffer.input_data[Chan_Alpha];
         if (!alpha_buffer) continue;
 
-        samples_to_merge.clear();
-        samples_to_merge.reserve(sample_count);
-
-        float accumulated_transparency = 1.0f;
-        for (int sample = sample_count - 1; sample >= 0; --sample) {
-            const float alpha = alpha_buffer[sample * buffer.input_channel_size];
-            accumulated_transparency *= (1.0f - alpha);
-
-            const bool extend_last_pair = !samples_to_merge.empty()
-                                          && merge_error(buffer, sample, sample + 1);
-
-            const bool merge_when_opaque = !samples_to_merge.empty()
-                                           && _merge_opaque
-                                           && accumulated_transparency < 1e-6;
-
-            if (merge_when_opaque) {
-                samples_to_merge.back().first = 0;
-                break;
-            }
-            if (extend_last_pair)
-                samples_to_merge.back().first = sample;
-            else
-                samples_to_merge.emplace_back(sample, sample);
-        }
+        std::vector<SampleRange> samples_to_merge;
+        samples_to_merge = should_merge_distance_alpha(buffer, sample_count);
         output_plane.setSampleCount(box_it, samples_to_merge.size());
         DeepOutputPixel output_pixel = output_plane.getPixel(box_it);
 
