@@ -35,18 +35,19 @@ class DeepSampleMerge : public DeepFilterOp {
     bool _use_distance_scaling { true };
     float _distance_threshold {0.05f};
     float _alpha_threshold {0.125f};
-    Channel diagnostic_channel;
+    Channel _diagnostic_channel;
 
     void merge_samples(const DeepPixelBuffer&, size_t, const ChannelMap&, size_t, size_t) const;
     [[nodiscard]] bool merge_error(const DeepPixelBuffer&, size_t, size_t) const;
 
 public:
     explicit DeepSampleMerge(Node* node) : DeepFilterOp(node) {
-        diagnostic_channel = getChannel("diagnostic.value");
+        _diagnostic_channel = getChannel("diagnostic.value");
     }
 
     void _validate(bool) override;
     void knobs(Knob_Callback) override;
+    void append(Hash&) override;
     bool doDeepEngine(Box, const ChannelSet&, DeepOutputPlane&) override;
 
     static const Op::Description description;
@@ -64,7 +65,7 @@ void DeepSampleMerge::merge_samples(const DeepPixelBuffer &buffer, const size_t 
     other_channels -= Chan_Alpha;
     other_channels -= Chan_DeepFront;
     other_channels -= Chan_DeepBack;
-    other_channels -= diagnostic_channel;
+    other_channels -= _diagnostic_channel;
 
     const size_t out_index = index * buffer.output_channel_size;
     float total_transparency = 1.0f;  //transparency = (1.0 - alpha)
@@ -78,8 +79,8 @@ void DeepSampleMerge::merge_samples(const DeepPixelBuffer &buffer, const size_t 
         total_transparency *= transparency;
     }
     buffer.output_data[Chan_Alpha][out_index] = 1.0f - total_transparency;
-    if (diagnostic_channel != Chan_Black)
-        buffer.output_data[diagnostic_channel][out_index] = static_cast<float>(upper_index-lower_index);
+    if (_diagnostic_channel != Chan_Black)
+        buffer.output_data[_diagnostic_channel][out_index] = static_cast<float>(upper_index-lower_index);
 
     buffer.output_data[Chan_DeepFront][out_index] = buffer.input_data[Chan_DeepFront][upper_index * buffer.input_channel_size];
     buffer.output_data[Chan_DeepBack][out_index] = _volumise
@@ -121,7 +122,7 @@ bool DeepSampleMerge::merge_error(const DeepPixelBuffer& buffer, size_t lower_in
 void DeepSampleMerge::_validate(bool for_real) {
     DeepFilterOp::_validate(for_real);
     ChannelSet new_channels = _deepInfo.channels();
-    new_channels += diagnostic_channel;
+    new_channels += _diagnostic_channel;
     new_channels += Mask_Deep;
     new_channels += Mask_Alpha;
     _deepInfo = DeepInfo(
@@ -151,10 +152,19 @@ void DeepSampleMerge::knobs(Knob_Callback f) {
     Bool_knob(f, &_merge_opaque, "merge_opaque", "Collapse Hidden Samples");
     Tooltip(f, "Removes samples that are completely hidden behind opaque surfaces, "
             "reducing unnecessary deep data.");
-    Channel_knob(f, &diagnostic_channel, 1, "diagnostic_channel");
+    Channel_knob(f, &_diagnostic_channel, 1, "diagnostic_channel");
     Tooltip(f, "Outputs merge information to the selected channel, "
             "showing how many source samples contribute to each result.");
     EndGroup(f);
+}
+
+void DeepSampleMerge::append(Hash& hash) {
+    hash.append(_use_distance_scaling);
+    hash.append(_distance_threshold);
+    hash.append(_alpha_threshold);
+    hash.append(_volumise);
+    hash.append(_merge_opaque);
+    hash.append(_diagnostic_channel);
 }
 
 bool DeepSampleMerge::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPlane& out) {
@@ -172,7 +182,7 @@ bool DeepSampleMerge::doDeepEngine(Box box, const ChannelSet& channels, DeepOutp
         return false;
 
     ChannelSet output_channels = channels;
-    output_channels += diagnostic_channel;
+    output_channels += _diagnostic_channel;
 
     DeepInPlaceOutputPlane output_plane(output_channels, box);
     output_plane.reserveSamples(input_plane.getTotalSampleCount());
