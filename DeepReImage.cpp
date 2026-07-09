@@ -132,6 +132,12 @@ bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPl
     if (!deep_input())
         return false;
 
+    if (!_combine) {
+        if (!deep_input()->deepEngine(box, channels, out))
+            return false;
+        return true;
+    }
+
     DeepPlane input_plane;
     if (!deep_input()->deepEngine(box, get_deep_channels(channels), input_plane))
         return false;
@@ -146,42 +152,6 @@ bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPl
     // one pointer per channel enum slot, stack allocated
     const float* input_data[Chan_Last] = {nullptr};
     float* output_data[Chan_Last] = {nullptr};
-
-    if (!_combine) {
-        for (Box::iterator it = box.begin(); it != box.end(); ++it) {
-            DeepPixel input_pixel = input_plane.getPixel(it);
-            const size_t sample_count = input_pixel.getSampleCount();
-
-            output_plane.setSampleCount(it, sample_count);
-            DeepOutputPixel output_pixel = output_plane.getPixel(it);
-
-            const float* in_array  = input_pixel.data();
-            float*       out_array = output_pixel.writable();
-
-            const ChannelMap& input_channel_map = input_plane.channels();
-            const ChannelMap& output_channel_map = output_plane.channels();
-            foreach(z, channels) {
-                if (input_channel_map.contains(z))
-                    input_data[z]  = in_array  + input_channel_map.chanNo(z);   // sample s is input_data[z][s * channel_size]
-                if (output_channel_map.contains(z))
-                    output_data[z] = out_array + output_channel_map.chanNo(z);
-            }
-
-            if (sample_count == 0)
-                continue;
-
-            foreach(z, channels) {
-                const float* src = input_data[z];
-                float*       dst = output_data[z];
-                for (size_t s = 0; s < sample_count; ++s) {
-                    float value = src ? src[s * input_channel_size] : 0.0f;
-                    dst[s * output_channel_size] = value;
-                }
-            }
-        }
-        out = static_cast<DeepOutputPlane>(output_plane);
-        return true;
-    }
 
     std::vector<float> alpha_samples;
     alpha_samples.reserve(512);  //hoping for the best and not too many samples
