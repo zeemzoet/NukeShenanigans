@@ -55,9 +55,9 @@ class DeepSampleMerge : public DeepFilterOp {
     bool _merge_opaque { true };
     Channel _diagnostic_channel;
 
-    void merge_sample_pairs(const DeepPixelBuffer&, size_t, const ChannelMap&, const SampleRange&) const;
-    void should_merge_distance_alpha(std::vector<SampleRange>&, const DeepPixelBuffer&, int) const;
-    void should_merge_RDP(std::vector<SampleRange>&, const DeepPixelBuffer&, int) const;
+    void merge_sample_range(const DeepPixel&, DeepOutputPixel&, size_t, const SampleRange&) const;
+    void should_merge_distance_alpha(std::vector<SampleRange>&, const DeepPixel&) const;
+    void should_merge_RDP(std::vector<SampleRange>&, const DeepPixel&) const;
 
 public:
     explicit DeepSampleMerge(Node* node) : DeepFilterOp(node) {
@@ -77,55 +77,52 @@ public:
 
 static Op* build(Node* node) { return new DeepSampleMerge(node); }
 
-void DeepSampleMerge::merge_sample_pairs(const DeepPixelBuffer &buffer, const size_t index, const ChannelMap &channels,
+void DeepSampleMerge::merge_sample_range(const DeepPixel &input, DeepOutputPixel& output, const size_t index,
                                     const SampleRange& sample_pair) const {
     assert(sample_pair.first <= sample_pair.last);
 
-    ChannelSet other_channels(channels);
+    ChannelSet other_channels(output.channels());
     other_channels -= Chan_Alpha;
     other_channels -= Chan_DeepFront;
     other_channels -= Chan_DeepBack;
     other_channels -= _diagnostic_channel;
 
-    const size_t out_index = index * buffer.output_channel_size;
     float total_transparency = 1.0f;  //transparency = (1.0 - alpha)
     for(size_t s = sample_pair.first; s <= sample_pair.last; ++s) {
-        const float transparency = 1.0f - buffer.input_data[Chan_Alpha][s * buffer.input_channel_size];
+        const float alpha = input.getOrderedSample(s, Chan_Alpha);
+        const float transparency = 1.0f - alpha;
         foreach(z, other_channels) {
-            const float* src = buffer.input_data[z];
-            float*       dst = buffer.output_data[z];
-            dst[out_index] += src[s * buffer.input_channel_size] * total_transparency;
+            const float src = input.getOrderedSample(s, z);
+            float&      dst = output.getWritableOrderedSample(index, z);
+            dst = dst * transparency + src;
         }
         total_transparency *= transparency;
     }
-    buffer.output_data[Chan_Alpha][out_index] = 1.0f - total_transparency;
+    output.getWritableOrderedSample(index, Chan_Alpha) = 1.0f - total_transparency;
     if (_diagnostic_channel != Chan_Black)
-        buffer.output_data[_diagnostic_channel][out_index] = static_cast<float>(sample_pair.last-sample_pair.first);
+        output.getWritableOrderedSample(index, _diagnostic_channel) = static_cast<float>(sample_pair.last-sample_pair.first);
 
-    buffer.output_data[Chan_DeepFront][out_index] = buffer.input_data[Chan_DeepFront][sample_pair.last * buffer.input_channel_size];
-    buffer.output_data[Chan_DeepBack][out_index] = _volumise
-                                                       ? buffer.input_data[Chan_DeepBack][sample_pair.first * buffer.input_channel_size]
-                                                       : buffer.input_data[Chan_DeepFront][sample_pair.last * buffer.input_channel_size];
+    output.getWritableOrderedSample(index, Chan_DeepFront) = input.getOrderedSample(sample_pair.last, Chan_DeepFront);
+    output.getWritableOrderedSample(index, Chan_DeepBack) = _volumise
+                                                        ? input.getOrderedSample(sample_pair.first, Chan_DeepBack)
+                                                        : input.getOrderedSample(sample_pair.last, Chan_DeepFront);
 }
 
-void DeepSampleMerge::should_merge_distance_alpha(std::vector<SampleRange>& samples_to_merge, const DeepPixelBuffer& buffer, const int sample_count) const {
-    auto should_merge = [&](size_t lower_index, size_t upper_index) {
-        assert(lower_index <= upper_index);
+void DeepSampleMerge::should_merge_distance_alpha(std::vector<SampleRange>& samples_to_merge, const DeepPixel& input_pixel) const {
+    auto should_merge = [&](size_t lower, size_t upper) {
+        assert(lower <= upper);
 
-        assert(buffer.input_data[Chan_DeepFront]);
-        assert(buffer.input_data[Chan_DeepBack]);
-        assert(buffer.input_data[Chan_Alpha]);
+        assert(input_pixel.channels().contains(Chan_Alpha));
+        assert(input_pixel.channels().contains(Chan_DeepFront));
+        assert(input_pixel.channels().contains(Chan_DeepBack));
 
-        const size_t lower = lower_index * buffer.input_channel_size;
-        const size_t upper = upper_index * buffer.input_channel_size;
+        const float front_lower = input_pixel.getOrderedSample(lower, Chan_DeepFront);
+        const float front_upper = input_pixel.getOrderedSample(upper, Chan_DeepFront);
+        const float back_lower = input_pixel.getOrderedSample(lower, Chan_DeepBack);
+        const float back_upper = input_pixel.getOrderedSample(upper, Chan_DeepBack);
 
-        const float front_lower = buffer.input_data[Chan_DeepFront][lower];
-        const float front_upper = buffer.input_data[Chan_DeepFront][upper];
-        const float back_lower = buffer.input_data[Chan_DeepBack][lower];
-        const float back_upper = buffer.input_data[Chan_DeepBack][upper];
-
-        const float alpha_lower = buffer.input_data[Chan_Alpha][lower];
-        const float alpha_upper = buffer.input_data[Chan_Alpha][upper];
+        const float alpha_lower = input_pixel.getOrderedSample(lower, Chan_Alpha);
+        const float alpha_upper = input_pixel.getOrderedSample(upper, Chan_Alpha);
 
         const float distance_between = std::abs((front_lower+back_lower) - (front_upper+back_upper)) / 2;
         const float average_depth = (front_lower + back_lower + front_upper + back_upper) / 4;
@@ -140,10 +137,10 @@ void DeepSampleMerge::should_merge_distance_alpha(std::vector<SampleRange>& samp
         return alpha_threshold_met && distance_threshold_met;
     };
 
-    const float* alpha_buffer = buffer.input_data[Chan_Alpha];
     float accumulated_transparency = 1.0f;
+    auto sample_count = static_cast<int>(input_pixel.getSampleCount());
     for (int sample = sample_count - 1; sample >= 0; --sample) {
-        const float alpha = alpha_buffer[sample * buffer.input_channel_size];
+        const float alpha = input_pixel.getOrderedSample(sample, Chan_Alpha);
         accumulated_transparency *= (1.0f - alpha);
 
         const bool extend_last_pair = !samples_to_merge.empty()
@@ -164,7 +161,9 @@ void DeepSampleMerge::should_merge_distance_alpha(std::vector<SampleRange>& samp
     }
 }
 
-void DeepSampleMerge::should_merge_RDP(std::vector<SampleRange>& samples_to_merge, const DeepPixelBuffer& buffer, int sample_count) const {
+void DeepSampleMerge::should_merge_RDP(std::vector<SampleRange>& samples_to_merge, const DeepPixel& input) const {
+    auto sample_count = static_cast<int>(input.getSampleCount());
+
     // First we make a graph, plotting the deep samples, remembering which
     // original sample each plotted point came from.
     std::vector<DeepPlotSample> deep_plotted;
@@ -172,13 +171,11 @@ void DeepSampleMerge::should_merge_RDP(std::vector<SampleRange>& samples_to_merg
 
     float total_transparency = 1.0f;
     float total_avg_depth = 0.0f;
-    // for (int sample = sample_count - 1; sample >= 0; --sample)
-    for (int sample = 0; sample < sample_count; ++sample) {
-        const size_t sample_index = sample * buffer.input_channel_size;
-
-        float front = buffer.input_data[Chan_DeepFront][sample_index];
-        float back  = buffer.input_data[Chan_DeepBack][sample_index];
-        const float alpha = buffer.input_data[Chan_Alpha][sample_index];
+    for (int sample = sample_count - 1; sample >= 0; --sample) {
+    //for (int sample = 0; sample < sample_count; ++sample) {
+        float front = input.getOrderedSample(sample, Chan_DeepFront);
+        float back  = input.getOrderedSample(sample, Chan_DeepBack);
+        const float alpha = input.getOrderedSample(sample, Chan_Alpha);
 
         total_avg_depth += (front + back) / 2;
         front = _use_distance_scaling ? front / total_avg_depth : front;
@@ -186,9 +183,9 @@ void DeepSampleMerge::should_merge_RDP(std::vector<SampleRange>& samples_to_merg
 
         deep_plotted.emplace_back(sample, front, 1.0f - total_transparency);
 
-        if (front != back) {
+        /*if (front != back) {
             deep_plotted.emplace_back(sample, back, 1.0f - total_transparency);
-        }
+        }*/
 
         total_transparency *= (1.0f - alpha);
     }
@@ -317,10 +314,6 @@ bool DeepSampleMerge::doDeepEngine(Box box, const ChannelSet& channels, DeepOutp
     DeepInPlaceOutputPlane output_plane(output_channels, box);
     output_plane.reserveSamples(input_plane.getTotalSampleCount());
 
-    DeepPixelBuffer buffer;
-    buffer.input_channel_size = input_plane.channels().size();
-    buffer.output_channel_size = output_plane.channels().size();
-
     for (Box::iterator box_it = box.begin(); box_it != box.end(); ++box_it) {
         DeepPixel input_pixel = input_plane.getPixel(box_it);
         const auto sample_count = static_cast<int>(input_pixel.getSampleCount());
@@ -330,39 +323,25 @@ bool DeepSampleMerge::doDeepEngine(Box box, const ChannelSet& channels, DeepOutp
             continue;
         }
 
-        const float* in_array  = input_pixel.data();
-        const ChannelMap& input_channel_map = input_plane.channels();
-        foreach(z, channels) {
-            if (input_channel_map.contains(z))
-                buffer.input_data[z]  = in_array  + input_channel_map.chanNo(z);
-        }
-
-        if (!buffer.input_data[Chan_Alpha]) continue;
-
         std::vector<SampleRange> samples_to_merge;
         samples_to_merge.reserve(sample_count);
         switch (_algorithm_choice) {
             case SIMPLE:
-                should_merge_distance_alpha(samples_to_merge, buffer, sample_count);
+                should_merge_distance_alpha(samples_to_merge, input_pixel);
                 break;
             case RDP:
-                should_merge_RDP(samples_to_merge, buffer, sample_count);
+                should_merge_RDP(samples_to_merge, input_pixel);
                 break;
             default: ;
         }
+
         output_plane.setSampleCount(box_it, samples_to_merge.size());
         DeepOutputPixel output_pixel = output_plane.getPixel(box_it);
 
-        float* out_array = output_pixel.writable();
-        ChannelMap output_channel_map = output_plane.channels();
-        foreach(z, output_channels) {
-            if (output_channel_map.contains(z))
-                buffer.output_data[z] = out_array + output_channel_map.chanNo(z);
-        }
         size_t out_sample_index = 0;
         for (const auto& sample_pair : samples_to_merge) {
             assert(sample_pair.last < sample_count);
-            merge_sample_pairs(buffer, out_sample_index, output_channel_map, sample_pair);
+            merge_sample_range(input_pixel, output_pixel, out_sample_index, sample_pair);
             ++out_sample_index;
         }
     }
@@ -413,14 +392,12 @@ static void ramer_douglas_peucker(const std::vector<DeepPlotSample>& deep_sample
     for (int i = start + 1; i < end; ++i) {
         float distance = point_line_distance(deep_samples[i], start_sample, end_sample);
         if (distance > max_distance) {
-            max_distance = distance;
+            max_distance = sqrt(distance);
             index = i;
         }
     }
 
-    // Compare by epsilon squared so we avoid
-    // having to use sqrt
-    if (max_distance > epsilon * epsilon) {
+    if (max_distance > epsilon) {
         keep[index] = 1;
         ramer_douglas_peucker(deep_samples, start, index, epsilon, keep);
         ramer_douglas_peucker(deep_samples, index, end, epsilon, keep);
