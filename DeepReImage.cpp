@@ -37,9 +37,11 @@ class DeepReImage : public DeepOp, public Iop {
     [[nodiscard]] ChannelSet get_colour_channels(const ChannelSet& channels, const bool with_alpha=false) const {
         ChannelSet new_channels(channels);
         new_channels &= _channels;
-        if (!_remap_alpha && !with_alpha)
+        if (!_remap_alpha)
             new_channels -= Mask_Alpha;
         new_channels -= Mask_Deep;
+        if (with_alpha)
+            new_channels += Mask_Alpha;
         return new_channels;
     }
 
@@ -123,7 +125,7 @@ void DeepReImage::_validate(bool for_real) {
 
 void DeepReImage::getDeepRequests(Box box, const ChannelSet& channels, int count, std::vector<RequestData>& requests) {
     if (const auto image = image_input())
-        image->request(box, get_colour_channels(channels), count);
+        image->request(box, get_colour_channels(channels, true), count);
     if (const auto deep = deep_input())
         requests.emplace_back(deep, box, get_deep_channels(channels), count);
 }
@@ -160,7 +162,7 @@ bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPl
     for (int y = box.y(); y < box.t(); ++y) {
 
         Row input_row(box.x(), box.r());
-        image_input()->get(y, box.x(), box.r(), get_colour_channels(channels), input_row);
+        image_input()->get(y, box.x(), box.r(), get_colour_channels(channels, true), input_row);
 
 #if TIMINGS
         auto t0 = std::chrono::high_resolution_clock::now();
@@ -204,8 +206,10 @@ bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPl
                 alpha_samples[s] = alpha;
             }
 
-            const float image_alpha = _remap_alpha ? input_row[Chan_Alpha][x] : 1.0f;
-            const float alpha_scale = image_alpha / (1.0f - total_transparency);
+            const float image_alpha = input_row[Chan_Alpha][x];
+            const float alpha_scale = _remap_alpha
+                                    ? image_alpha / (1.0f - total_transparency)
+                                    : 1.0f / (1.0f - total_transparency);
             if (_remap_alpha) {
                 float input_transparency = 1.0f;
                 float output_transparency = 1.0f;
@@ -236,7 +240,7 @@ bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPl
             foreach(z, get_colour_channels(channels)) {
                 const float row_val = input_row[z][x];
                 float*      dst     = output_data[z];
-                const float scaled_row_val = _remap_alpha ? row_val / image_alpha : row_val;
+                const float scaled_row_val = image_alpha > 0 ? row_val / image_alpha : 0.0f;
                 for (size_t s = 0; s < sample_count; ++s)
                     dst[s * output_channel_size] = scaled_row_val * alpha_samples[s];
             }
@@ -288,26 +292,33 @@ void DeepReImage::engine(int y, int x, int r, ChannelMask channels, Row& out_row
 
     image_input()->get(y, x, r, colour_channels, in_row);
 
-    std::vector<float> deep_alpha(r - x);
-    float total_transparency = 1.0f;
+    float* alpha_out_ptr = out_row.writable(Chan_Alpha) + x;
+    const float* image_alpha = in_row[Chan_Alpha] + x;
     for (int i = x; i < r; i++) {
+        // Calculate deep alpha
         auto deep_pixel = input_plane.getPixel(y, i);
+        float total_transparency = 1.0f;
         for (size_t s = 0; s < deep_pixel.getSampleCount(); ++s) {
             total_transparency *= (1.0f - deep_pixel.getUnorderedSample(s, Chan_Alpha));
         }
-        deep_alpha[i - x] = 1.0f - total_transparency;
+
+        const float deep_alpha = 1.0f - total_transparency;
+        if (deep_alpha > 1e-6f)
+            alpha_out_ptr[i - x] = _remap_alpha ? image_alpha[i - x] : deep_alpha;
+        else
+            alpha_out_ptr[i - x] = 0.0f;
     }
-    foreach(z, colour_channels) {
-        float* out_ptr = out_row.writable(z);
-        const float* in_ptr = in_row[z];
+
+    foreach(z, get_colour_channels(channels)) {
+        float* out_ptr = out_row.writable(z) + x;
+        const float* in_ptr = in_row[z] + x;
         for (int i = x; i < r; i++) {
-            if (z == Chan_Alpha && !_remap_alpha) {
-                out_ptr[i] = deep_alpha[i - x];
-                continue;
-            }
-            out_ptr[i] = deep_alpha[i - x] * in_ptr[i];
+            const float alpha = image_alpha[i - x];
+            const float scaled_row_val = alpha > 1e-6f ? in_ptr[i - x] / alpha : 0.0f;
+            out_ptr[i - x] = scaled_row_val * alpha_out_ptr[i - x];
         }
     }
+
     foreach(z, other_channels) {
         float* out_ptr = out_row.writable(z);
         for (int i = x; i < r; i++) {
