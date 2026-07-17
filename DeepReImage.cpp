@@ -6,6 +6,7 @@
 #include <DDImage/Iop.h>
 #include <DDImage/Knobs.h>
 #include <DDImage/Row.h>
+#include <DDImage/Pixel.h>
 #include <chrono>
 
 #define TIMINGS false
@@ -23,6 +24,7 @@ class DeepReImage : public DeepOp, public Iop {
 
     bool _combine;
     bool _remap_alpha;
+    bool _deep_retint;
     ChannelSet _channels;
 
     enum {UNION, IMAGE, DEEP};
@@ -44,6 +46,8 @@ class DeepReImage : public DeepOp, public Iop {
             new_channels += Mask_Alpha;
         return new_channels;
     }
+
+    static bool get_deep_combined_rgb(Pixel&, const DeepPixel&);
 
     [[nodiscard]] Iop* image_input() const { return dynamic_cast<Iop*>(Op::input(0)); }
     [[nodiscard]] DeepOp* deep_input() const { return dynamic_cast<DeepOp*>(Op::input(1)); }
@@ -81,6 +85,28 @@ public:
 };
 
 static Iop* build(Node* node) { return new DeepReImage(node); }
+
+bool DeepReImage::get_deep_combined_rgb(Pixel& pixel, const DeepPixel& input_pixel) {
+    if (!pixel.channels.contains(Mask_RGB) || !ChannelSet(input_pixel.channels()).contains(Mask_RGB))
+        return false;
+
+    pixel.set(0.0f);
+
+    float& red = pixel[Chan_Red];
+    float& green = pixel[Chan_Green];
+    float& blue = pixel[Chan_Blue];
+
+    for (int s = 0; s < input_pixel.getSampleCount(); ++s) {
+        float alpha = input_pixel.getOrderedSample(s, Chan_Alpha);
+
+        red = red * (1.0f - alpha) + input_pixel.getOrderedSample(s, Chan_Red);
+        green = green * (1.0f - alpha) + input_pixel.getOrderedSample(s, Chan_Green);
+        blue = blue * (1.0f - alpha) + input_pixel.getOrderedSample(s, Chan_Blue);
+    }
+    return true;
+}
+
+
 void DeepReImage::_validate(bool for_real) {
     Box total_box = Box();
     ChannelSet total_channels(Mask_None);
@@ -119,6 +145,8 @@ void DeepReImage::_validate(bool for_real) {
     info_.set(total_box);
     info_.setFormats(total_formats);
     total_channels &= _channels;
+    total_channels += Mask_Deep;
+    total_channels += Mask_Alpha;
     info_.channels() = total_channels;
     _deepInfo = DeepInfo(info_);
 }
@@ -173,6 +201,15 @@ bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPl
 
             DeepPixel input_pixel = input_plane.getPixel(y, x);
             const size_t sample_count = input_pixel.getSampleCount();
+
+            Pixel rgb_div_pixel(Mask_RGB);
+            bool can_deep_retint = get_deep_combined_rgb(rgb_div_pixel, input_pixel);
+            if (can_deep_retint) {
+                float eps = 1e-3f;
+                rgb_div_pixel[Chan_Red] = (input_row[Chan_Red][x] + eps) / (rgb_div_pixel[Chan_Red] + eps);
+                rgb_div_pixel[Chan_Green] = (input_row[Chan_Green][x]) / (rgb_div_pixel[Chan_Green] + eps);
+                rgb_div_pixel[Chan_Blue] = (input_row[Chan_Blue][x]) / (rgb_div_pixel[Chan_Blue] + eps);
+            }
 
             output_plane.setSampleCount(y, x, sample_count);
             DeepOutputPixel output_pixel = output_plane.getPixel(y,x);
@@ -238,11 +275,30 @@ bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPl
                 output_data[Chan_Alpha][s * output_channel_size] = alpha_samples[s];
 
             foreach(z, get_colour_channels(channels)) {
-                const float row_val = input_row[z][x];
-                float*      dst     = output_data[z];
-                const float scaled_row_val = image_alpha > 0 ? row_val / image_alpha : 0.0f;
-                for (size_t s = 0; s < sample_count; ++s)
-                    dst[s * output_channel_size] = scaled_row_val * alpha_samples[s];
+                const float  row_val = input_row[z][x];
+                const float* src     = input_data[z];
+                float*       dst     = output_data[z];
+                const float mapped_image_value = image_alpha > 0 ? row_val / image_alpha : 0.0f;
+                float scaled_rgb;
+                switch (colourIndex(z)) {
+                    case 0:
+                        scaled_rgb = rgb_div_pixel[Chan_Red];
+                        break;
+                    case 1:
+                        scaled_rgb = rgb_div_pixel[Chan_Green];
+                        break;
+                    case 2:
+                        scaled_rgb = rgb_div_pixel[Chan_Blue];
+                        break;
+                    default:
+                        scaled_rgb = 1.0f;
+                }
+                for (size_t s = 0; s < sample_count; ++s) {
+                    if (can_deep_retint && _deep_retint)
+                        dst[s * output_channel_size] = src[s * input_channel_size] * scaled_rgb;
+                    else
+                        dst[s* output_channel_size] = mapped_image_value * alpha_samples[s];
+                }
             }
         }
 #if TIMINGS
@@ -320,25 +376,25 @@ void DeepReImage::engine(int y, int x, int r, ChannelMask channels, Row& out_row
     }
 
     foreach(z, other_channels) {
-        float* out_ptr = out_row.writable(z);
+        float* out_ptr = out_row.writable(z) + x;
         for (int i = x; i < r; i++) {
             auto deep_pixel = input_plane.getPixel(y, i);
             size_t sample_count = deep_pixel.getSampleCount();
             if (sample_count == 0) {
-                out_ptr[i] = 0.0f;
+                out_ptr[i - x] = 0.0f;
                 continue;
             }
-            for (size_t s = 0; s < sample_count; ++s)
-                out_ptr[i] = deep_pixel.getUnorderedSample(s, z);
+            out_ptr[i - x] = deep_pixel.getUnorderedSample(sample_count-1, z);
         }
     }
 }
 
 void DeepReImage::knobs(Knob_Callback f) {
     Input_ChannelMask_knob(f, &_channels, 0, "channels");
-    SetFlags(f, Knob::STARTLINE);
     Bool_knob(f, &_combine, "combine_deep", "Combine");
+    SetFlags(f, Knob::STARTLINE);
     Bool_knob(f, &_remap_alpha, "use_image_alpha", "Use Image Alpha");
+    Bool_knob(f, &_deep_retint, "deep_retint", "Deep-re-tint");
     Enumeration_knob(f, &_bbox_type, bbox_names, "bbox", "Set BBox to");
 }
 
