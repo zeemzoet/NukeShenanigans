@@ -30,10 +30,12 @@ class DeepReImage : public DeepOp, public Iop {
     enum {UNION, IMAGE, DEEP};
     int _bbox_type;
 
-    static ChannelSet get_deep_channels(const ChannelSet& channels) {
+    ChannelSet get_deep_channels(const ChannelSet& channels) const {
         ChannelSet new_channels(channels);
         new_channels += Mask_Deep;
         new_channels += Mask_Alpha;
+        if (_deep_retint)
+            new_channels += Mask_RGB;
         return new_channels;
     }
     [[nodiscard]] ChannelSet get_colour_channels(const ChannelSet& channels, const bool with_alpha=false) const {
@@ -56,6 +58,7 @@ public:
     explicit DeepReImage(Node* node) : Iop(node)
     , _combine(true)
     , _remap_alpha(true)
+    , _deep_retint(false)
     , _channels(Mask_All)
     , _bbox_type(UNION)
     {}
@@ -147,6 +150,8 @@ void DeepReImage::_validate(bool for_real) {
     total_channels &= _channels;
     total_channels += Mask_Deep;
     total_channels += Mask_Alpha;
+    if (_deep_retint)
+        total_channels += Mask_RGB;
     info_.channels() = total_channels;
     _deepInfo = DeepInfo(info_);
 }
@@ -190,7 +195,10 @@ bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPl
     for (int y = box.y(); y < box.t(); ++y) {
 
         Row input_row(box.x(), box.r());
-        image_input()->get(y, box.x(), box.r(), get_colour_channels(channels, true), input_row);
+        ChannelSet image_channels = get_colour_channels(channels, true);
+        if (_deep_retint)
+            image_channels += Mask_RGB;
+        image_input()->get(y, box.x(), box.r(), image_channels, input_row);
 
 #if TIMINGS
         auto t0 = std::chrono::high_resolution_clock::now();
@@ -204,12 +212,6 @@ bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPl
 
             Pixel rgb_div_pixel(Mask_RGB);
             bool can_deep_retint = get_deep_combined_rgb(rgb_div_pixel, input_pixel);
-            if (can_deep_retint) {
-                float eps = 1e-3f;
-                rgb_div_pixel[Chan_Red] = (input_row[Chan_Red][x] + eps) / (rgb_div_pixel[Chan_Red] + eps);
-                rgb_div_pixel[Chan_Green] = (input_row[Chan_Green][x]) / (rgb_div_pixel[Chan_Green] + eps);
-                rgb_div_pixel[Chan_Blue] = (input_row[Chan_Blue][x]) / (rgb_div_pixel[Chan_Blue] + eps);
-            }
 
             output_plane.setSampleCount(y, x, sample_count);
             DeepOutputPixel output_pixel = output_plane.getPixel(y,x);
@@ -219,7 +221,7 @@ bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPl
 
             const ChannelMap& input_channel_map = input_plane.channels();
             const ChannelMap& output_channel_map = output_plane.channels();
-            foreach(z, channels) {
+            foreach(z, get_deep_channels(channels)) {
                 if (input_channel_map.contains(z))
                     input_data[z]  = in_array  + input_channel_map.chanNo(z);   // sample s is input_data[z][s * channel_size]
                 if (output_channel_map.contains(z))
@@ -229,8 +231,8 @@ bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPl
             if (sample_count == 0)
                 continue;
 
-            const float* a = input_data[Chan_Alpha];
-            if (!a) continue;
+            const float* input_deep_alpha = input_data[Chan_Alpha];
+            if (!input_deep_alpha) continue;
 
             // fingers crossed we don't often hit 512 samples.
             if (alpha_samples.size() < sample_count)
@@ -238,15 +240,16 @@ bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPl
 
             float total_transparency = 1.0f;
             for (size_t s = 0; s < sample_count; ++s) {
-                float alpha = a[s * input_channel_size];
+                float alpha = input_deep_alpha[s * input_channel_size];
                 total_transparency *= (1.0f - alpha);
                 alpha_samples[s] = alpha;
             }
 
+            const float total_alpha = 1.0f - total_transparency;
             const float image_alpha = input_row[Chan_Alpha][x];
             const float alpha_scale = _remap_alpha
-                                    ? image_alpha / (1.0f - total_transparency)
-                                    : 1.0f / (1.0f - total_transparency);
+                                    ? image_alpha / total_alpha
+                                    : 1.0f / total_alpha;
             if (_remap_alpha) {
                 float input_transparency = 1.0f;
                 float output_transparency = 1.0f;
@@ -276,28 +279,25 @@ bool DeepReImage::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPl
 
             foreach(z, get_colour_channels(channels)) {
                 const float  row_val = input_row[z][x];
-                const float* src     = input_data[z];
                 float*       dst     = output_data[z];
-                const float mapped_image_value = image_alpha > 0 ? row_val / image_alpha : 0.0f;
-                float scaled_rgb;
-                switch (colourIndex(z)) {
-                    case 0:
-                        scaled_rgb = rgb_div_pixel[Chan_Red];
-                        break;
-                    case 1:
-                        scaled_rgb = rgb_div_pixel[Chan_Green];
-                        break;
-                    case 2:
-                        scaled_rgb = rgb_div_pixel[Chan_Blue];
-                        break;
-                    default:
-                        scaled_rgb = 1.0f;
-                }
+
+                const float unpremultiplied_row_val = image_alpha > 0 ? row_val / image_alpha : 0.0f;
+
+                Channel rgb_channel = brother(Chan_Red, colourIndex(z));
+                float tint_rgb_value = image_alpha > 0 ? rgb_div_pixel[rgb_channel] : 1.0f;
+
                 for (size_t s = 0; s < sample_count; ++s) {
-                    if (can_deep_retint && _deep_retint)
-                        dst[s * output_channel_size] = src[s * input_channel_size] * scaled_rgb;
+                    float& output = dst[s * output_channel_size];
+                    if (can_deep_retint && _deep_retint && rgb_channel != Chan_Black) {
+                        float eps = 1e-5f;
+                        float deep_rgb_value = input_data[rgb_channel][s*input_channel_size];
+                        float deep_alpha_value = input_deep_alpha[s * input_channel_size];
+                        deep_rgb_value = deep_alpha_value > 0 ? deep_rgb_value / deep_alpha_value * alpha_samples[s] : 0.0f;
+
+                        output = deep_rgb_value * ((unpremultiplied_row_val + eps) / (tint_rgb_value + eps)) * total_alpha;
+                    }
                     else
-                        dst[s* output_channel_size] = mapped_image_value * alpha_samples[s];
+                        output = unpremultiplied_row_val * alpha_samples[s];
                 }
             }
         }
