@@ -6,6 +6,7 @@
 #include <DDImage/DeepSample.h>
 #include <DDImage/DeepAccumPixelOp.h>
 #include <DDImage/Knobs.h>
+#include <DDImage/Row.h>
 
 using namespace DD::Image;
 
@@ -18,11 +19,12 @@ class DeepKeymix : public DeepOnlyOp {
 
     [[nodiscard]] DeepOp* b_input() const { return dynamic_cast<DeepOp*>(input(0)); }
     [[nodiscard]] DeepOp* a_input() const { return dynamic_cast<DeepOp*>(input(1)); }
+    [[nodiscard]] Iop* mask_input() const { return dynamic_cast<Iop*>(input(2)); }
 
     static void scale_deep_sample(const DeepPixel& , const ChannelMap&, DeepSampleVector&, float);
 
 public:
-    explicit DeepKeymix(Node* node) : DeepOnlyOp(node) {}
+    explicit DeepKeymix(Node* node) : DeepOnlyOp(node), _mix(1.0f) {}
 
     void _validate(bool) override;
     void getDeepRequests(Box, const ChannelSet&, int, std::vector<RequestData>&) override;
@@ -87,6 +89,13 @@ void DeepKeymix::_validate(bool for_real) {
         total_box.merge(deepinfo.box());
         total_channels += deepinfo.channels();
     }
+    if (mask_input()) {
+        mask_input()->validate(for_real);
+        const auto& info = DeepInfo(mask_input()->info());
+
+        total_box.merge(info.box());
+        total_channels += info.channels();
+    }
     _deepInfo = DeepInfo(total_formats, total_box, total_channels);
 }
 
@@ -95,6 +104,8 @@ void DeepKeymix::getDeepRequests(Box box, const ChannelSet& channels, int count,
         b_input()->deepRequest(box, channels, count);
     if (a_input())
         a_input()->deepRequest(box, channels, count);
+    if (mask_input())
+        mask_input()->request(box, Mask_Alpha, count);
 }
 
 bool DeepKeymix::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPlane& out) {
@@ -116,30 +127,70 @@ bool DeepKeymix::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPla
     DeepInPlaceOutputPlane output_plane(channels, box);
     output_plane.reserveSamples(b_input_plane.getTotalSampleCount() + a_input_plane.getTotalSampleCount());
 
-    for (Box::iterator box_it = box.begin(); box_it != box.end(); ++box_it) {
-        DeepPixel b_input_pixel = b_input_plane.getPixel(box_it);
-        DeepPixel a_input_pixel = a_input_plane.getPixel(box_it);
 
-        DeepSampleVector total_incoming;
-        DeepSampleVector total_outgoing;
-        ChannelMap all_channels(channels);
+    for (int y = box.y(); y < box.t(); ++y) {
+        Row input_row(box.x(), box.r());
 
-        scale_deep_sample(b_input_pixel, all_channels, total_incoming, _mix);
-        scale_deep_sample(a_input_pixel, all_channels, total_incoming, 1.0f - _mix);
+        if (mask_input())
+            mask_input()->get(y, box.x(), box.r(), Mask_Alpha, input_row);
 
-        CombineOverlappingSamples(all_channels, total_incoming, total_outgoing);
+        // iterate over x
+        for (int x = box.x(); x < box.r(); ++x) {
 
-        output_plane.setSampleCount(box_it, total_outgoing.size());
-        DeepOutputPixel out_pixel = output_plane.getPixel(box_it);
+            float alpha_mix = 1.0f;
+            if (mask_input())
+                alpha_mix = input_row[Chan_Alpha][x];
 
-        if (total_outgoing.size() > 0) {
-            foreach(z, channels) {
-                size_t index = 0;
-                for (DeepSample sample: total_outgoing) {
-                    float& out_float = out_pixel.getWritableUnorderedSample(index, z);
-                    float in_float = sample[z];
-                    out_float = in_float;
-                    ++index;
+            alpha_mix = std::max(std::min(alpha_mix, 0.0f), 1.0f);
+            alpha_mix *= _mix;
+
+            DeepPixel b_input_pixel = b_input_plane.getPixel(y,x);
+            DeepPixel a_input_pixel = a_input_plane.getPixel(y,x);
+
+            ChannelMap all_channels(channels);
+
+            if (alpha_mix == 0.0f) {
+                output_plane.setSampleCount(y, x, b_input_pixel.getSampleCount());
+                DeepOutputPixel out_pixel = output_plane.getPixel(y, x);
+                for (int s = 0; s < out_pixel.getSampleCount(); ++s) {
+                    foreach(z, channels) {
+                        out_pixel.getWritableUnorderedSample(s, z) = b_input_pixel.getUnorderedSample(s, z);
+                    }
+                }
+            }
+
+            else if (alpha_mix == 1.0f) {
+                output_plane.setSampleCount(y, x, a_input_pixel.getSampleCount());
+                DeepOutputPixel out_pixel = output_plane.getPixel(y, x);
+                for (int s = 0; s < out_pixel.getSampleCount(); ++s) {
+                    foreach(z, channels) {
+                        out_pixel.getWritableUnorderedSample(s, z) = a_input_pixel.getUnorderedSample(s, z);
+                    }
+                }
+            }
+
+            else {
+                DeepSampleVector total_incoming;
+                DeepSampleVector total_outgoing;
+
+                scale_deep_sample(b_input_pixel, all_channels, total_outgoing, 1.0f - alpha_mix);
+                scale_deep_sample(a_input_pixel, all_channels, total_incoming, alpha_mix);
+
+                CombineOverlappingSamples(all_channels, total_incoming, total_outgoing);
+
+                output_plane.setSampleCount(y, x, total_outgoing.size());
+                DeepOutputPixel out_pixel = output_plane.getPixel(y, x);
+
+                if (total_outgoing.size() > 0) {
+                    foreach(z, channels) {
+                        size_t index = 0;
+                        for (DeepSample sample: total_outgoing) {
+                            float& out_float = out_pixel.getWritableOrderedSample(index, z);
+                            float in_float = sample[z];
+                            out_float = in_float;
+                            ++index;
+                        }
+                    }
                 }
             }
         }
@@ -150,27 +201,38 @@ bool DeepKeymix::doDeepEngine(Box box, const ChannelSet& channels, DeepOutputPla
     return true;
 }
 
-void DeepKeymix::scale_deep_sample(const DeepPixel& input_pixel, const ChannelMap& channels, DeepSampleVector& deep_sample_vector, float mix) {
+void DeepKeymix::scale_deep_sample(const DeepPixel& input_pixel, const ChannelMap& channels, DeepSampleVector& deep_sample_vector, const float mix) {
 
     ChannelSet other_channels(channels);
     other_channels -= Mask_Alpha;
     other_channels -= Mask_Deep;
 
+    float total_transparency = 1.0f;
+    for (size_t s = 0; s < input_pixel.getSampleCount(); ++s) {
+        const float alpha = input_pixel.getUnorderedSample(s, Chan_Alpha);
+        total_transparency *= (1.0f - alpha);
+    }
+
+    const float alpha_scale = mix / (1.0f - total_transparency);
+
     float input_transparency = 1.0f;
     float output_transparency = 1.0f;
     for (size_t s = 0; s < input_pixel.getSampleCount(); ++s) {
-        DeepSample deep_sample(channels, input_pixel, s);
-        float orig_alpha = deep_sample[Chan_Alpha];
-        input_transparency *= 1.0f - deep_sample[Chan_Alpha];
-        float target_transparency = 1.0f - (1.0f - input_transparency) * mix;
+        DeepSample deep_sample(channels, input_pixel, (input_pixel.getSampleCount() - 1 -s));
+        float& alpha_sample = deep_sample[Chan_Alpha];
+        const float orig_alpha_sample = deep_sample[Chan_Alpha];
+
+        input_transparency *= 1.0f - alpha_sample;
+        float target_transparency = 1.0f - (1.0f - input_transparency) * alpha_scale;
+
         if (output_transparency > 1e-6f)
-            deep_sample[Chan_Alpha] = 1.0f - target_transparency / output_transparency;
+            alpha_sample = 1.0f - target_transparency / output_transparency;
         else
-            deep_sample[Chan_Alpha] = 1.0f;
+            alpha_sample = 1.0f;
         output_transparency = target_transparency;
 
         foreach(z, other_channels)
-            deep_sample[z] = deep_sample[z] / orig_alpha * deep_sample[Chan_Alpha];
+            deep_sample[z] = deep_sample[z] / orig_alpha_sample * alpha_sample * (1.0f - total_transparency);
 
         deep_sample_vector.push_back(deep_sample);
     }
