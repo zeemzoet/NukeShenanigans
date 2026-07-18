@@ -213,7 +213,8 @@ void DeepKeymix::scale_deep_sample(const DeepPixel& input_pixel, const ChannelMa
         total_transparency *= (1.0f - alpha);
     }
 
-    const float alpha_scale = mix / (1.0f - total_transparency);
+    const float total_alpha = 1.0f - total_transparency;
+    const float alpha_scale = mix / total_alpha;
 
     float input_transparency = 1.0f;
     float output_transparency = 1.0f;
@@ -223,7 +224,7 @@ void DeepKeymix::scale_deep_sample(const DeepPixel& input_pixel, const ChannelMa
         const float orig_alpha_sample = deep_sample[Chan_Alpha];
 
         input_transparency *= 1.0f - alpha_sample;
-        float target_transparency = 1.0f - (1.0f - input_transparency) * alpha_scale;
+        const float target_transparency = 1.0f - (1.0f - input_transparency) * alpha_scale;
 
         if (output_transparency > 1e-6f)
             alpha_sample = 1.0f - target_transparency / output_transparency;
@@ -232,7 +233,7 @@ void DeepKeymix::scale_deep_sample(const DeepPixel& input_pixel, const ChannelMa
         output_transparency = target_transparency;
 
         foreach(z, other_channels)
-            deep_sample[z] = deep_sample[z] / orig_alpha_sample * alpha_sample * (1.0f - total_transparency);
+            deep_sample[z] = deep_sample[z] / orig_alpha_sample * alpha_sample * total_alpha;
 
         deep_sample_vector.push_back(deep_sample);
     }
